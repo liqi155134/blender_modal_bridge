@@ -148,4 +148,4 @@ debian_slim **Python 3.13** + `apt xorg libxkbcommon0 ffmpeg` + `pip bpy==5.2.0`
 |---|---|---|
 | **MVP** | 云端 app(render)+ addon(提交/进度/取回)+ 部署脚本 | Mac Blender 里对真 .blend 一键云渲 8 帧动画取回 mp4;demo 冒烟;cancel 干净 |
 | **二期** | bake(云端 worker + 协议 + UI 子区)| 高低模命名约定场景烘 normal+AO 取回贴图 zip |
-| 三期(看需求) | 分块上传(GB 级)、批量几何/LOD、模拟烘焙 | — |
+| 三期(看需求) | BAT 打包 + 资产级 CAS 增量上传(替代原"分块上传"方向,见 Flamenco 调研)、批量几何/LOD、模拟烘焙 | — |

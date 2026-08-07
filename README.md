@@ -80,7 +80,10 @@ docs/plans/                   # 实施计划
 
 - **二期:烘焙贴图(bake)**——高模→低模 normal / AO、程序化材质烘 PBR 贴图集;
   `_low` / `_high` 命名约定配对,对象 × pass 并行(协议已预留 `task_type: "bake"`)
-- 分块上传(GB 级场景)、转台预设
+- **打包升级**:pack_all 换 [BAT(Blender Asset Tracer)](https://pypi.org/project/blender-asset-tracer/)
+  ——追踪贴图 / 链接库 / caches 打自包含包,配 **资产级 CAS 增量上传**(改哪个贴图传哪个,
+  参考 Flamenco Shaman 的思路),大场景迭代不再重传整包
+- Output Properties 面板入口、失败帧单独重试、转台预设
 
 ## License
 
