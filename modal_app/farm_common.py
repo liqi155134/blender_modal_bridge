@@ -1,0 +1,120 @@
+"""
+farm_common.py — 提交协议的纯函数层(校验 / 帧列表 / ffmpeg 命令 / 文件名清洗)。
+
+零第三方依赖(纯 stdlib):云端 farm_app(容器内以顶层名 import)、Blender addon、
+单测三方共用。协议改动先改这里的校验再动别处。
+task_type 从第一版就存在:MVP 只实现 render,二期 bake 时这里加分支,骨架不动。
+"""
+import os
+import re
+
+MAX_FRAMES = 2000       # 单 job 帧数上限:cancel 窗口可控 + 并行费用护栏
+MAX_FRAME_NO = 99999    # 帧号上限:产物文件名 %05d,超了字典序乱、ffmpeg glob 顺序错
+
+
+def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
+    """校验提交 payload,返回 (扁平 job dict, None) 或 (None, 错误信息)。
+    payload 形态:{task_type?, blend_path?, render: {…}}。
+    blend_path=None 表示内置 demo 场景(不碰 Volume,链路冒烟)。
+    resolution/samples/camera 不给 = 尊重 .blend 场景设置(艺术家文件是真源)。"""
+    if not isinstance(payload, dict):
+        return None, "payload 必须是对象"
+    task_type = str(payload.get("task_type") or "render").lower()
+    if task_type != "render":
+        return None, f"task_type={task_type!r} 暂未支持(MVP 只有 render;bake 二期)"
+    blend_path = payload.get("blend_path")
+    if blend_path is not None:
+        norm = os.path.normpath(str(blend_path)).replace("\\", "/")
+        if (not isinstance(blend_path, str) or not blend_path.startswith("scenes/")
+                or ".." in blend_path or blend_path != norm):
+            return None, "blend_path 必须是 Volume 上 scenes/ 下的相对路径(由 /upload 返回)"
+    r = payload.get("render") or {}
+    if not isinstance(r, dict):
+        return None, "render 必须是对象"
+    try:
+        start = int(r.get("frame_start", 1))
+        end = int(r.get("frame_end", start))
+        step = int(r.get("frame_step", 1))
+    except (TypeError, ValueError):
+        return None, "frame_start / frame_end / frame_step 必须是整数"
+    if step < 1:
+        return None, "frame_step 必须 ≥ 1"
+    if end < start:
+        return None, "frame_end 必须 ≥ frame_start"
+    if start < 0 or end > MAX_FRAME_NO:
+        return None, f"帧号范围 0..{MAX_FRAME_NO}"
+    n = len(range(start, end + 1, step))
+    if n > MAX_FRAMES:
+        return None, f"单 job 最多 {MAX_FRAMES} 帧(现 {n} 帧);请分段提交"
+    output = str(r.get("output") or "video").lower()
+    if output not in ("video", "frames"):
+        return None, "output 只能是 video(合成 mp4)或 frames(zip 帧序列)"
+    fmt = str(r.get("file_format") or "PNG").upper()
+    if fmt not in ("PNG", "OPEN_EXR"):
+        return None, "file_format 只能是 PNG 或 OPEN_EXR"
+    if output == "video" and fmt != "PNG":
+        return None, "video 输出只支持 PNG 帧;EXR 请用 output=frames"
+    try:
+        fps = int(r.get("fps", 24))
+    except (TypeError, ValueError):
+        return None, "fps 必须是整数"
+    if not 1 <= fps <= 240:
+        return None, "fps 范围 1..240"
+    job = {"task_type": task_type, "blend_path": blend_path,
+           "frame_start": start, "frame_end": end, "frame_step": step,
+           "output": output, "file_format": fmt, "fps": fps}
+    for k in ("resolution_x", "resolution_y", "resolution_percentage", "samples"):
+        v = r.get(k)
+        if v is None:
+            continue
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return None, f"{k} 必须是整数"
+        if v < 1:
+            return None, f"{k} 必须 ≥ 1"
+        job[k] = v
+    cam = r.get("camera")
+    if cam is not None:
+        if not isinstance(cam, str) or not cam.strip():
+            return None, "camera 必须是非空字符串(场景里的相机对象名)"
+        job["camera"] = cam.strip()
+    return job, None
+
+
+def frames_list(job: dict) -> list[int]:
+    """规范化后的 job → 要渲染的帧号列表。"""
+    return list(range(job["frame_start"], job["frame_end"] + 1, job["frame_step"]))
+
+
+def parse_frame_spec(spec: str) -> tuple[int, int, int]:
+    """帧范围字符串 → (start, end, step)。"1-250" / "1-250:2" / "7"。
+    非法输入抛 ValueError(语义校验交给 normalize_job,这里只管语法)。"""
+    s = str(spec).strip()
+    step = 1
+    if ":" in s:
+        s, st = s.rsplit(":", 1)
+        step = int(st)
+    if "-" in s:
+        a, b = s.split("-", 1)
+        start, end = int(a), int(b)
+    else:
+        start = end = int(s)
+    return start, end, step
+
+
+def ffmpeg_cmd(frames_dir: str, out_path: str, fps: int) -> list[str]:
+    """PNG 帧序列 → H.264 mp4。glob 按字典序 = 帧序(帧名固定 %05d 零填充)。
+    pad 滤镜兜底奇数分辨率(yuv420p 要求偶数,场景分辨率是艺术家定的,不该因此失败)。"""
+    return ["ffmpeg", "-y", "-framerate", str(fps), "-pattern_type", "glob",
+            "-i", f"{frames_dir}/*.png",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            out_path]
+
+
+def safe_scene_name(name: str) -> str:
+    """上传文件名清洗:取 basename、危险字符换 _,空则兜底。upload 端点用。"""
+    base = os.path.basename(str(name).replace("\\", "/")).strip()
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    return base or "scene.blend"
