@@ -74,9 +74,10 @@ class FarmClient:
     # 超过就切块串行发,服务端经 Volume 中转拼接 —— 96MB 留足余量。
     UPLOAD_CHUNK = 96 << 20
 
-    def upload(self, filepath: str, name: str, progress_cb=None) -> dict:
+    def upload(self, filepath: str, name: str, progress_cb=None, cancel_check=None) -> dict:
         """上传 .blend,返回 {blend_path, size_bytes}。≤96MB 单发;更大自动分块串行。
-        progress_cb(sent_bytes, total_bytes) 按全局累计字节回调(网络线程)。"""
+        progress_cb(sent_bytes, total_bytes) 按全局累计字节回调(网络线程)。
+        cancel_check() 返回 True 时在下一个块边界中止(抛 FarmError;单发模式不可中止)。"""
         p = Path(filepath)
         size = p.stat().st_size
         if size <= self.UPLOAD_CHUNK:
@@ -88,6 +89,8 @@ class FarmClient:
         d = None
         with open(p, "rb") as f:
             for index in range(total):
+                if cancel_check and cancel_check():
+                    raise FarmError("上传已被用户取消")
                 chunk = f.read(self.UPLOAD_CHUNK)
                 base = index * self.UPLOAD_CHUNK
                 body = io.BytesIO(chunk)

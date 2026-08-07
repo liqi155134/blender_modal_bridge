@@ -83,7 +83,7 @@ class FARM_PT_panel(bpy.types.Panel):
             meta = f"{meta} · {it.gpu}" if meta else it.gpu
         if meta:
             row.label(text=meta)
-        if it.status in ("queued", "running"):
+        if it.status in ("uploading", "queued", "running"):
             row.operator("farm.cancel", text="", icon="X").job_id = it.job_id
         elif it.status == "completed" and not it.downloaded:
             row.operator("farm.download", text="", icon="IMPORT").job_id = it.job_id

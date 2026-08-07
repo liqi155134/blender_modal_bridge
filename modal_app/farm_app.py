@@ -367,7 +367,12 @@ def render_job(job: dict, job_id: str) -> dict:
                 modal.FunctionCall.from_id(cid).cancel()
             except Exception:
                 pass
-        job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
+        cur = job_state.get(job_id) or {}
+        if cur.get("status") == "cancelled":
+            # cancel 端点已写终态;本异常只是取消传播(subcall 被 cancel → get() 抛
+            # "Function call was cancelled…")——别用 failed + SDK 吓人文案覆盖用户的取消
+            raise
+        job_state[job_id] = {**cur, "status": "failed",
                              "error": str(e), "trace": tb[-2000:],
                              "completed_at": time.time()}
         raise

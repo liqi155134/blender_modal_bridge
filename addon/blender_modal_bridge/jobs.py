@@ -12,6 +12,7 @@ _POLLING = set()                        # 正在轮询中的 job_id(防重复起
 _TIMER_ON = False
 _XFER: dict = {}                        # 传输进度:job 键 → (sent_bytes, total_bytes)。
                                         # 网络线程高频写(每块),timer 低频读 → UI,零锁
+_CANCEL_UPLOAD: set = set()             # 用户点了取消的本地上传键;上传线程分块间检查
 
 
 class FarmJobItem(bpy.types.PropertyGroup):

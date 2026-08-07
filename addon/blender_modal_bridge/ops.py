@@ -138,18 +138,24 @@ class FARM_OT_submit(bpy.types.Operator):
                 jobs._XFER[_k] = (sent, total)
             try:
                 c = jobs.get_client()
-                up = c.upload(tmp_path, name, progress_cb=on_up)
+                up = c.upload(tmp_path, name, progress_cb=on_up,
+                              cancel_check=lambda: local_key in jobs._CANCEL_UPLOAD)
                 d = c.run(render, up["blend_path"])
             except Exception as e:
                 # ⚠ 必须在 except 块内先取值:Python 会在块退出时 del e,
                 # 闭包延迟到 timer 执行时引用 e 会 NameError(被 tick 兜底吞掉,
                 # 表现为任务永远卡 uploading —— 2026-08-08 实锤踩过)
                 err = str(e)[:400]
+                was_cancel = local_key in jobs._CANCEL_UPLOAD
+                jobs._CANCEL_UPLOAD.discard(local_key)
 
-                def fail(_err=err):
+                def fail(_err=err, _c=was_cancel):
                     it2 = jobs.find(local_key)
                     if it2:
-                        it2.status, it2.error = "failed", _err
+                        if _c:
+                            it2.status, it2.error = "cancelled", ""
+                        else:
+                            it2.status, it2.error = "failed", _err
                         jobs.persist()
                 jobs.push_result(fail)
                 return
@@ -181,6 +187,11 @@ class FARM_OT_cancel(bpy.types.Operator):
 
     def execute(self, context):
         jid = self.job_id
+        if jid.startswith("local-"):
+            # 还在上传:置取消标志,上传线程在下一个块边界(≤96MB)中止 → 状态转 cancelled
+            jobs._CANCEL_UPLOAD.add(jid)
+            self.report({"INFO"}, "取消中(在当前分块传完后生效)…")
+            return {"FINISHED"}
 
         def work():
             try:
