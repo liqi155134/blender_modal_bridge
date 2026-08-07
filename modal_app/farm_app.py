@@ -1,0 +1,253 @@
+"""
+farm_app.py — Blender Cycles serverless 渲染农场(Modal 独立 app)。
+
+部署:python farm_deploy.py(容器内;别裸跑 modal deploy —— FARM_* env 会缺)。
+部署后 6 个端点(<ws> 由 modal 账号决定):
+    https://<ws>--blender-bridge-{upload,run,status,cancel,fetch,health}.modal.run
+
+骨架来自 Modal 官方 blender_video 示例,生产化改造:
+  1. 资产走 Volume(scenes/,由 /upload 写入)不走 bytes;场景**每容器每 job 只加载一次**
+     (缓存 key=job_id:同 job 分到本容器的所有帧免重复 open_mainfile;跨 job 必重载,
+     overrides 不同 —— 正确性优先于省那几秒)。
+  2. compute_device_type=OPTIX(L40S 142 RT core;Cycles 通常快 1.5-2×),枚举不到
+     OPTIX 设备逐级回退 CUDA → CPU;denoiser 仅在场景已开 denoise 时切 OPTIX 实现。
+  3. bpy==5.2.0 + Python 3.13(与部署者 Mac Blender 5.2 LTS 对版,避免旧 bpy 开新
+     .blend 的前向兼容风险)。
+  4. job 协议 task_type 化(farm_common.normalize_job):MVP 只有 render,二期 bake
+     加 worker 函数即可,upload/status/cancel/fetch/进度骨架不动。
+"""
+import os
+import shutil
+import subprocess
+import time
+import uuid
+from pathlib import Path
+
+import modal
+
+import farm_common
+
+APP_NAME = os.environ.get("FARM_APP_NAME", "blender-bridge")
+VOLUME_NAME = os.environ.get("FARM_VOLUME", "blender-bridge")
+SECRET_NAME = os.environ.get("FARM_SECRET", "blender-bridge-secrets")
+FARM_GPU = os.environ.get("FARM_GPU", "L40S")
+BPY_VERSION = "5.2.0"   # 单一真源:镜像 pip 与 health 上报都用它
+# 单帧超时覆盖重场景(体积/毛发单帧半小时级);coordinator 超时要盖全片。
+# ⚠ Modal timeout / gpu / max_containers 都是部署期固定,换值需重新部署。
+FRAME_TIMEOUT = int(os.environ.get("FARM_FRAME_TIMEOUT", "1800"))
+JOB_TIMEOUT = int(os.environ.get("FARM_JOB_TIMEOUT", "14400"))
+MAX_PARALLEL = int(os.environ.get("FARM_MAX_PARALLEL", "10"))
+
+app = modal.App(APP_NAME)
+models_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+job_state = modal.Dict.from_name(f"{APP_NAME}-jobs", create_if_missing=True)
+
+# Secret 含 FARM_API_KEY(farm_deploy.py 创建);没建过则空 secret 兜底(端点会拒绝所有请求)
+try:
+    farm_secret = modal.Secret.from_name(SECRET_NAME)
+except Exception:
+    farm_secret = modal.Secret.from_dict({})
+
+# 镜像:pip 版 bpy 无头跑 Cycles,不装完整 Blender、不起 X server(xorg 只是给
+# bpy 提供 X11 客户端库依赖)。coordinator/端点共用本镜像(要 ffmpeg;bpy 装了不用,
+# 省一次独立 build)。
+farm_image = (
+    modal.Image.debian_slim(python_version="3.13")   # bpy 5.2 要 py3.13
+    .apt_install("xorg", "libxkbcommon0", "ffmpeg")
+    .pip_install(f"bpy=={BPY_VERSION}", "fastapi[standard]")
+    # 运行时读的 env 必须烤进镜像(deploy 子进程的 env 只在部署解析期可见,不会自动进容器):
+    #   APP_NAME/VOLUME/SECRET → 容器 re-import 本文件时顶层 from_name;FARM_GPU → 显示/health
+    .env({k: os.environ[k] for k in (
+        "FARM_APP_NAME", "FARM_VOLUME", "FARM_SECRET", "FARM_GPU",
+    ) if os.environ.get(k)})
+    .add_local_python_source("farm_app", "farm_common")
+)
+
+
+# ============================================================================
+# job_state 清理:终态条目超 TTL 删,数量兜底(照搬 comfyui_modal_bridge 验证过的策略)
+# ============================================================================
+JOB_TTL_S = int(os.environ.get("FARM_JOB_TTL", "3600"))
+JOB_MAX = int(os.environ.get("FARM_JOB_MAX", "200"))
+
+
+def _sweep_job_state():
+    """best-effort 清理过期/超量的终态 job。任何异常都不影响主流程。"""
+    try:
+        now = time.time()
+        items = list(job_state.items())
+    except Exception:
+        return
+    terminal = {"completed", "failed", "cancelled"}
+    finished = [(jid, s.get("completed_at") or 0) for jid, s in items
+                if isinstance(s, dict) and s.get("status") in terminal]
+
+    def _drop(jid):
+        for k in (jid, f"{jid}:call", f"{jid}:subcalls"):  # 连带删独立 key,不留孤儿
+            try:
+                del job_state[k]
+            except Exception:
+                pass
+
+    for jid, done_at in finished:
+        if done_at and now - done_at > JOB_TTL_S:
+            _drop(jid)
+    try:
+        remaining = [(j, s.get("completed_at") or 0) for j, s in job_state.items()
+                     if isinstance(s, dict) and s.get("status") in terminal]
+        if len(remaining) > JOB_MAX:
+            remaining.sort(key=lambda x: x[1])
+            for jid, _ in remaining[: len(remaining) - JOB_MAX]:
+                _drop(jid)
+    except Exception:
+        pass
+
+
+# ============================================================================
+# 场景装配(全部只在 render_frame 进程内调用;bpy 只在函数内 import —— 本文件
+# 顶层会被端点所在的无 GPU 容器 import,顶层 import bpy 白付内存)
+# ============================================================================
+def _build_demo_scene():
+    """内置冒烟场景:金属立方体 360° 旋转 + 地面,48 帧 720p/64 samples。
+    不碰 Volume,验证 部署→分帧→OPTIX→合成→取回 全链路。"""
+    import math
+
+    import bpy
+    bpy.ops.wm.read_factory_settings()
+    scene = bpy.context.scene
+    scene.render.engine = "CYCLES"
+    scene.render.resolution_x, scene.render.resolution_y = 1280, 720
+    scene.cycles.samples = 64
+    scene.frame_start, scene.frame_end = 1, 48
+    cube = bpy.data.objects["Cube"]
+    mat = bpy.data.materials.new("DemoMetal")
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes["Principled BSDF"]
+    bsdf.inputs["Metallic"].default_value = 1.0
+    bsdf.inputs["Roughness"].default_value = 0.15
+    bsdf.inputs["Base Color"].default_value = (0.8, 0.45, 0.1, 1.0)
+    cube.data.materials.append(mat)
+    cube.rotation_euler = (0.0, 0.0, 0.0)
+    cube.keyframe_insert("rotation_euler", frame=1)
+    cube.rotation_euler = (0.0, 0.0, math.radians(360.0))
+    cube.keyframe_insert("rotation_euler", frame=48)
+    bpy.ops.mesh.primitive_plane_add(size=20, location=(0, 0, -1))
+
+
+def _apply_overrides(job: dict):
+    """payload 显式给的才覆盖;没给的尊重 .blend 场景设置(艺术家的文件是真源)。"""
+    import bpy
+    scene = bpy.context.scene
+    if job.get("resolution_x"):
+        scene.render.resolution_x = job["resolution_x"]
+    if job.get("resolution_y"):
+        scene.render.resolution_y = job["resolution_y"]
+    if job.get("resolution_percentage"):
+        scene.render.resolution_percentage = job["resolution_percentage"]
+    if job.get("samples"):
+        scene.cycles.samples = job["samples"]
+    cam = job.get("camera")
+    if cam:
+        obj = bpy.data.objects.get(cam)
+        if obj is None or obj.type != "CAMERA":
+            cams = [o.name for o in bpy.data.objects if o.type == "CAMERA"]
+            raise ValueError(f"场景里没有相机 {cam!r}(可选: {cams})")
+        scene.camera = obj
+
+
+def _missing_files() -> list[str]:
+    """加载后查外部资产断链(未 pack 的贴图/链接库):渲染不失败(Blender 出粉色),
+    但必须让用户看得见 —— 结果写进 job_state.warnings。"""
+    import bpy
+    missing = []
+    for img in bpy.data.images:
+        if img.source == "FILE" and img.filepath and not img.packed_file:
+            if not Path(bpy.path.abspath(img.filepath)).exists():
+                missing.append(f"image: {img.filepath}")
+    for lib in bpy.data.libraries:
+        if lib.filepath and not Path(bpy.path.abspath(lib.filepath)).exists():
+            missing.append(f"library: {lib.filepath}")
+    return missing[:20]   # 封顶,别撑爆 job_state
+
+
+def _configure_cycles_gpu() -> str:
+    """OPTIX 优先(RT core 正解),枚举不到该类设备逐级回退 CUDA → CPU(宁可慢不可炸)。
+    只支持 CYCLES:EEVEE 无头需要 GPU context/EGL,显式报错比默默换引擎出错片强。
+    返回实际用的后端名(写进产物,用户能核对没白付 RT core 的钱)。"""
+    import bpy
+    scene = bpy.context.scene
+    if scene.render.engine != "CYCLES":
+        raise RuntimeError(
+            f"场景渲染引擎是 {scene.render.engine},当前只支持 CYCLES"
+            "(EEVEE 无头渲染需 GPU context,暂不支持;请在 Blender 里切到 Cycles)")
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    for dtype in ("OPTIX", "CUDA"):
+        try:
+            prefs.compute_device_type = dtype
+        except TypeError:      # 该 bpy 构建不含此后端
+            continue
+        prefs.get_devices()
+        if any(d.type == dtype for d in prefs.devices):
+            for d in prefs.devices:
+                d.use = (d.type != "CPU")
+            scene.cycles.device = "GPU"
+            # 尊重场景的 denoise 开关,只把实现切到 OPTIX(硬件降噪)
+            if dtype == "OPTIX" and getattr(scene.cycles, "use_denoising", False):
+                scene.cycles.denoiser = "OPTIX"
+            print(f"[farm] compute_device={dtype}: "
+                  + ", ".join(d.name for d in prefs.devices if d.use))
+            return dtype
+    print("[farm] ⚠ 未枚举到 GPU 设备,回退 CPU 渲染(慢)")
+    scene.cycles.device = "CPU"
+    return "CPU"
+
+
+# 容器级场景缓存:key=job_id。同 job 分到本容器的所有帧只 open_mainfile 一次
+# (大场景加载分钟级,这是把官方示例"每帧传 bytes+重加载"换成 Volume 的核心收益)。
+_SCENE = {"key": None, "warnings": [], "device": None}
+
+
+@app.function(
+    gpu=FARM_GPU,
+    image=farm_image,
+    volumes={"/vol": models_vol},
+    timeout=FRAME_TIMEOUT,
+    max_containers=MAX_PARALLEL,   # 并行度上限 = 费用护栏
+)
+def render_frame(job: dict, frame: int, job_id: str) -> dict:
+    """渲染单帧,写 Volume _outputs/<job_id>/frames/frame_%05d.<ext>,返回帧元数据。
+    bpy 状态是进程级全局的 —— Modal function 默认一容器一 input 串行,天然安全。"""
+    import bpy
+    if _SCENE["key"] != job_id:
+        # 首次(或换 job):同步 Volume 拿最新上传的 .blend(此时无打开文件,reload 安全)
+        models_vol.reload()
+        if job.get("blend_path"):
+            p = Path("/vol") / job["blend_path"]
+            if not p.is_file():
+                raise FileNotFoundError(
+                    f".blend 不在 Volume 上: {job['blend_path']}(upload 成功了吗?)")
+            bpy.ops.wm.open_mainfile(filepath=str(p))
+        else:
+            _build_demo_scene()
+        _apply_overrides(job)
+        _SCENE["warnings"] = _missing_files()
+        _SCENE["device"] = _configure_cycles_gpu()
+        _SCENE["key"] = job_id
+    scene = bpy.context.scene
+    scene.frame_set(frame)
+    ext = "exr" if job["file_format"] == "OPEN_EXR" else "png"
+    # 先渲到容器本地盘再拷 Volume:Blender 内部写文件不该踩 FUSE 的性能/部分写风险
+    tmp_out = Path(f"/tmp/frame_{frame:05d}.{ext}")
+    scene.render.filepath = str(tmp_out)
+    scene.render.image_settings.file_format = job["file_format"]
+    t0 = time.time()
+    bpy.ops.render.render(write_still=True)
+    out_dir = Path(f"/vol/_outputs/{job_id}/frames")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final = out_dir / tmp_out.name
+    shutil.copyfile(tmp_out, final)
+    tmp_out.unlink(missing_ok=True)
+    models_vol.commit()   # 并发 commit 安全(各容器写各自的帧文件)
+    return {"frame": frame, "path": f"_outputs/{job_id}/frames/{final.name}",
+            "size": final.stat().st_size, "secs": round(time.time() - t0, 1),
+            "warnings": _SCENE["warnings"], "device": _SCENE["device"]}
