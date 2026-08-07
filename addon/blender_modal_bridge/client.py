@@ -152,8 +152,10 @@ class FarmClient:
             raise FarmError(f"{what}: {d['error']}")   # 服务端语义错误:不重试
         return d
 
-    def run(self, render: dict, blend_path: str | None) -> dict:
-        body = {"task_type": "render", "render": render}
+    def run(self, task: dict, blend_path: str | None) -> dict:
+        """提交任务。task = {"task_type": "render", "render": {…}} 或
+        {"task_type": "bake", "bake": {…}}(协议见 API.md)。"""
+        body = dict(task)
         if blend_path:
             body["blend_path"] = blend_path
         d = self._post("run", body)

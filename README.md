@@ -76,10 +76,20 @@ docs/specs/                   # 设计文档
 docs/plans/                   # 实施计划
 ```
 
-## Roadmap
+## 烘焙贴图(Bake)
 
-- **二期:烘焙贴图(bake)**——高模→低模 normal / AO、程序化材质烘 PBR 贴图集;
-  `_low` / `_high` 命名约定配对,对象 × pass 并行(协议已预留 `task_type: "bake"`)
+面板顶部切到 **Bake** 模式:在视图里**选中要烘的网格**(可多选)→ 勾选 pass
+(Normal / AO / Diffuse(albedo)/ Roughness / Emit / Combined)→ 分辨率 / margin →
+Submit。云端按 **对象 × pass 并行**(每单元一张 L40S),产物 `textures.zip`
+(`<对象>_<pass>.png|exr`)自动下载。
+
+- 前提:对象 **UV 已展好**(无 UV 明确报错);目标贴图由农场创建,Normal/Roughness/AO
+  自动存为 Non-Color
+- **高模→低模**:勾 "High → Low",按 `<name>_low` / `<name>_high` 命名约定自动配对
+  (选中低模提交;cage extrusion 可调)
+- 上限:单 job ≤ 256 单元(对象 × pass);多材质槽对象每个槽都会自动挂目标节点
+
+## Roadmap
 - **打包升级**:pack_all 换 [BAT(Blender Asset Tracer)](https://pypi.org/project/blender-asset-tracer/)
   ——追踪贴图 / 链接库 / caches 打自包含包,配 **资产级 CAS 增量上传**(改哪个贴图传哪个,
   参考 Flamenco Shaman 的思路),大场景迭代不再重传整包

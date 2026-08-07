@@ -34,6 +34,7 @@ def get(label, **params):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--task", default="render", choices=["render", "bake"])
     ap.add_argument("--frames", default="1-8")
     ap.add_argument("--output", default="video", choices=["video", "frames"])
     ap.add_argument("--format", default="PNG", choices=["PNG", "OPEN_EXR"])
@@ -41,8 +42,14 @@ def main():
     args = ap.parse_args()
 
     print("health:", get("health"))
-    d = post("run", {"render": {"frames": args.frames,   # 复合 spec 直接透传("1,3-5,8:2")
-                                "output": args.output, "file_format": args.format}})
+    if args.task == "bake":
+        payload = {"task_type": "bake",
+                   "bake": {"objects": ["Cube"], "passes": ["NORMAL", "AO"],
+                            "resolution": 512, "file_format": args.format}}
+    else:
+        payload = {"render": {"frames": args.frames,   # 复合 spec 直接透传("1,3-5,8:2")
+                              "output": args.output, "file_format": args.format}}
+    d = post("run", payload)
     if "id" not in d:
         sys.exit(f"提交失败: {d}")
     job_id = d["id"]

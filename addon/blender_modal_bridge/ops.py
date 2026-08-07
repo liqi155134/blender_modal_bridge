@@ -35,6 +35,43 @@ def _frames_label(render: dict) -> str:
     return f"{render['frame_start']}-{render['frame_end']}"
 
 
+def _build_task(context) -> tuple[dict | None, str | None]:
+    """按 farm_task 模式构建提交任务,返回 (task, None) 或 (None, 错误)。
+    BAKE:对象 = 当前选中的网格(最 Blender 原生的选择方式)。"""
+    sc = context.scene
+    if sc.farm_task == "BAKE":
+        objs = [o.name for o in context.selected_objects if o.type == "MESH"]
+        if not objs:
+            return None, "Bake 需要先在视图里选中至少一个网格对象"
+        passes = [p for p, on in (
+            ("NORMAL", sc.farm_bake_normal), ("AO", sc.farm_bake_ao),
+            ("DIFFUSE", sc.farm_bake_diffuse), ("ROUGHNESS", sc.farm_bake_roughness),
+            ("EMIT", sc.farm_bake_emit), ("COMBINED", sc.farm_bake_combined)) if on]
+        if not passes:
+            return None, "至少勾选一个 bake pass"
+        bake = {"objects": objs, "passes": passes,
+                "resolution": sc.farm_bake_resolution, "margin": sc.farm_bake_margin,
+                "selected_to_active": sc.farm_bake_s2a,
+                "file_format": sc.farm_bake_format}
+        if sc.farm_bake_s2a:
+            bake["cage_extrusion"] = sc.farm_bake_cage
+        return {"task_type": "bake", "bake": bake}, None
+    render = _scene_props(context)
+    if render["output"] == "video" and render["file_format"] != "PNG":
+        return None, "video 输出只支持 PNG;EXR 请切 output=frames"
+    spec = render.get("frames")
+    if spec is not None and not re.fullmatch(r"[\d\s,:\-]+", spec or ""):
+        return None, f'帧范围形如 "3, 5-10, 47-327:2",收到 {spec!r}'
+    return {"task_type": "render", "render": render}, None
+
+
+def _task_label(task: dict) -> str:
+    if task["task_type"] == "bake":
+        b = task["bake"]
+        return f"bake {len(b['objects'])}obj×{len(b['passes'])}pass"
+    return _frames_label(task["render"])
+
+
 def _precheck_missing() -> list[str]:
     """本地预检:pack 不进去的外部资产(比云端更早暴露)。链接库必警告——不会上云。
     跳过孤儿数据块(users=0,无任何材质引用):迁移残留的死数据与渲染无关,
@@ -107,14 +144,9 @@ class FARM_OT_submit(bpy.types.Operator):
         if not p.endpoint or not p.farm_key:
             self.report({"ERROR"}, "先在 addon preferences 填 endpoint 和 farm_key")
             return {"CANCELLED"}
-        render = _scene_props(context)
-        if render["output"] == "video" and render["file_format"] != "PNG":
-            self.report({"ERROR"}, "video 输出只支持 PNG;EXR 请切 output=frames")
-            return {"CANCELLED"}
-        spec = render.get("frames")
-        if spec is not None and not re.fullmatch(r"[\d\s,:\-]+", spec or ""):
-            # 粗校验挡明显非法(细校验在云端);别等上传完才发现 spec 打错
-            self.report({"ERROR"}, f'帧范围形如 "3, 5-10, 47-327:2",收到 {spec!r}')
+        task, terr = _build_task(context)
+        if terr:
+            self.report({"ERROR"}, terr)
             return {"CANCELLED"}
         # 主线程:pack + save copy(bpy.ops 必须主线程)
         tmp_path, warnings = _pack_and_save_copy()
@@ -125,7 +157,7 @@ class FARM_OT_submit(bpy.types.Operator):
         wm = context.window_manager
         it = wm.farm_jobs.add()
         it.job_id = f"local-{os.urandom(4).hex()}"   # 提交成功后换成云端 id
-        it.label = f"{name}  {_frames_label(render)}"
+        it.label = f"{name}  {_task_label(task)}"
         it.status = "uploading"
         if warnings:
             it.warnings = "; ".join(warnings)[:800]
@@ -140,7 +172,7 @@ class FARM_OT_submit(bpy.types.Operator):
                 c = jobs.get_client()
                 up = c.upload(tmp_path, name, progress_cb=on_up,
                               cancel_check=lambda: local_key in jobs._CANCEL_UPLOAD)
-                d = c.run(render, up["blend_path"])
+                d = c.run(task, up["blend_path"])
             except Exception as e:
                 # ⚠ 必须在 except 块内先取值:Python 会在块退出时 del e,
                 # 闭包延迟到 timer 执行时引用 e 会 NameError(被 tick 兜底吞掉,

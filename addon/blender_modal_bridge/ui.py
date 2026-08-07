@@ -6,6 +6,29 @@ from . import jobs
 
 def _scene_props():
     S = bpy.types.Scene
+    S.farm_task = bpy.props.EnumProperty(
+        name="Task", default="RENDER",
+        items=[("RENDER", "Render", "渲染(静帧/动画)"),
+               ("BAKE", "Bake", "烘焙贴图(选中对象 × 勾选 pass 并行)")])
+    S.farm_bake_normal = bpy.props.BoolProperty(name="Normal", default=True)
+    S.farm_bake_ao = bpy.props.BoolProperty(name="AO", default=True)
+    S.farm_bake_diffuse = bpy.props.BoolProperty(name="Diffuse", default=False,
+                                                 description="albedo(自动关直接/间接光)")
+    S.farm_bake_roughness = bpy.props.BoolProperty(name="Rough", default=False)
+    S.farm_bake_emit = bpy.props.BoolProperty(name="Emit", default=False)
+    S.farm_bake_combined = bpy.props.BoolProperty(name="Combined", default=False)
+    S.farm_bake_resolution = bpy.props.IntProperty(
+        name="Resolution", default=2048, min=64, max=8192,
+        description="目标贴图分辨率(方形)")
+    S.farm_bake_margin = bpy.props.IntProperty(name="Margin", default=16, min=1, max=64)
+    S.farm_bake_s2a = bpy.props.BoolProperty(
+        name="High → Low", default=False,
+        description="高模→低模烘焙:按 <name>_low / <name>_high 命名约定自动配对")
+    S.farm_bake_cage = bpy.props.FloatProperty(
+        name="Cage Extrusion", default=0.05, min=0.0, precision=3)
+    S.farm_bake_format = bpy.props.EnumProperty(
+        name="Format", default="PNG",
+        items=[("PNG", "PNG", ""), ("OPEN_EXR", "OpenEXR", "")])
     S.farm_frame_mode = bpy.props.EnumProperty(
         name="Frames", default="SCENE",
         items=[("SCENE", "Scene Range", "用场景的 frame_start/end/step"),
@@ -25,7 +48,11 @@ def _scene_props():
 
 def _del_scene_props():
     S = bpy.types.Scene
-    for k in ("farm_frame_mode", "farm_frames_spec", "farm_output", "farm_file_format"):
+    for k in ("farm_task", "farm_bake_normal", "farm_bake_ao", "farm_bake_diffuse",
+              "farm_bake_roughness", "farm_bake_emit", "farm_bake_combined",
+              "farm_bake_resolution", "farm_bake_margin", "farm_bake_s2a",
+              "farm_bake_cage", "farm_bake_format",
+              "farm_frame_mode", "farm_frames_spec", "farm_output", "farm_file_format"):
         delattr(S, k)
 
 
@@ -52,13 +79,32 @@ class FARM_PT_panel(bpy.types.Panel):
             box.label(text="填 Endpoint 和 Farm Key(farm_deploy 打印的)")
             return
 
+        row = lay.row(align=True)
+        row.prop(sc, "farm_task", expand=True)
+
         col = lay.column(align=True)
-        col.prop(sc, "farm_frame_mode")
-        if sc.farm_frame_mode == "CUSTOM":
-            col.prop(sc, "farm_frames_spec")
-        row = col.row(align=True)
-        row.prop(sc, "farm_output", expand=True)
-        col.prop(sc, "farm_file_format")
+        if sc.farm_task == "BAKE":
+            n_sel = len([o for o in context.selected_objects if o.type == "MESH"])
+            col.label(text=f"选中网格: {n_sel} 个" if n_sel else "先在视图选中要烘的网格",
+                      icon="MESH_DATA" if n_sel else "ERROR")
+            grid = col.grid_flow(columns=3, align=True)
+            for p in ("farm_bake_normal", "farm_bake_ao", "farm_bake_diffuse",
+                      "farm_bake_roughness", "farm_bake_emit", "farm_bake_combined"):
+                grid.prop(sc, p, toggle=True)
+            row = col.row(align=True)
+            row.prop(sc, "farm_bake_resolution")
+            row.prop(sc, "farm_bake_margin")
+            col.prop(sc, "farm_bake_format")
+            col.prop(sc, "farm_bake_s2a")
+            if sc.farm_bake_s2a:
+                col.prop(sc, "farm_bake_cage")
+        else:
+            col.prop(sc, "farm_frame_mode")
+            if sc.farm_frame_mode == "CUSTOM":
+                col.prop(sc, "farm_frames_spec")
+            row = col.row(align=True)
+            row.prop(sc, "farm_output", expand=True)
+            col.prop(sc, "farm_file_format")
         if sc.render.engine != "CYCLES":
             col.label(text=f"引擎是 {sc.render.engine},农场只支持 Cycles", icon="ERROR")
 
