@@ -135,10 +135,15 @@ class FARM_OT_submit(bpy.types.Operator):
                 up = c.upload(tmp_path, name, progress_cb=on_up)
                 d = c.run(render, up["blend_path"])
             except Exception as e:
-                def fail():
+                # ⚠ 必须在 except 块内先取值:Python 会在块退出时 del e,
+                # 闭包延迟到 timer 执行时引用 e 会 NameError(被 tick 兜底吞掉,
+                # 表现为任务永远卡 uploading —— 2026-08-08 实锤踩过)
+                err = str(e)[:400]
+
+                def fail(_err=err):
                     it2 = jobs.find(local_key)
                     if it2:
-                        it2.status, it2.error = "failed", str(e)[:400]
+                        it2.status, it2.error = "failed", _err
                         jobs.persist()
                 jobs.push_result(fail)
                 return
