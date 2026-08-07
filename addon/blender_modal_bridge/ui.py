@@ -70,28 +70,61 @@ class FARM_PT_panel(bpy.types.Panel):
         wm = context.window_manager
         if not len(wm.farm_jobs):
             return
-        box = lay.box()
         for it in reversed(list(wm.farm_jobs)[-8:]):     # 最近 8 条,新的在上
-            row = box.row(align=True)
-            row.label(text=it.label or it.job_id[:8],
-                      icon=_STATUS_ICON.get(it.status, "QUESTION"))
-            if it.status == "running" and it.total:
-                row.label(text=f"{it.step}/{it.total}  {it.s_it:.0f}s/帧")
-                row.operator("farm.cancel", text="", icon="X").job_id = it.job_id
-            elif it.status in ("queued", "uploading", "downloading"):
-                row.label(text=it.status)
-                if it.status != "uploading":
-                    row.operator("farm.cancel", text="", icon="X").job_id = it.job_id
-            elif it.status == "completed":
-                if it.downloaded:
-                    row.label(text="已下载")
-                else:
-                    row.operator("farm.download", text="", icon="IMPORT").job_id = it.job_id
-            elif it.status == "failed":
-                row.label(text=(it.error or "failed")[:40])
-            if it.warnings:
-                sub = box.row()
-                sub.label(text=f"⚠ {it.warnings[:70]}", icon="LIBRARY_DATA_BROKEN")
+            self.draw_job(lay.box(), it)
+
+    def draw_job(self, box, it) -> None:
+        """单个 job 的卡片:标题行(名字/id/GPU/操作)+ 进度条/状态行 + 警告行。"""
+        row = box.row(align=True)
+        row.label(text=it.label or it.job_id[:8],
+                  icon=_STATUS_ICON.get(it.status, "QUESTION"))
+        meta = "" if it.job_id.startswith("local-") else it.job_id[:8]
+        if it.gpu:
+            meta = f"{meta} · {it.gpu}" if meta else it.gpu
+        if meta:
+            row.label(text=meta)
+        if it.status in ("queued", "running"):
+            row.operator("farm.cancel", text="", icon="X").job_id = it.job_id
+        elif it.status == "completed" and not it.downloaded:
+            row.operator("farm.download", text="", icon="IMPORT").job_id = it.job_id
+
+        if it.status == "uploading":
+            if it.xfer_total:
+                box.progress(factor=min(1.0, it.xfer_sent / it.xfer_total),
+                             text=f"上传 {it.xfer_sent} / {it.xfer_total} MB", type="BAR")
+            else:
+                box.label(text="打包场景 / 准备上传…", icon="EXPORT")
+        elif it.status == "downloading":
+            if it.xfer_total:
+                box.progress(factor=min(1.0, it.xfer_sent / it.xfer_total),
+                             text=f"下载 {it.xfer_sent} / {it.xfer_total} MB", type="BAR")
+            else:
+                box.label(text="下载产物中…", icon="IMPORT")
+        elif it.status == "running":
+            if it.total:
+                box.progress(factor=min(1.0, it.step / max(1, it.total)),
+                             text=f"{it.step} / {it.total} 帧 · {it.s_it:.1f}s/帧"
+                                  f" · 已 {it.elapsed}s", type="BAR")
+            else:
+                box.label(text="云端启动中(容器冷启 + 场景加载)…", icon="SORTTIME")
+        elif it.status == "queued":
+            box.label(text="已提交,排队中…", icon="SORTTIME")
+        elif it.status == "completed":
+            if it.downloaded:
+                box.label(text=f"✓ 完成,已下载 → {it.out_dir}"[:72], icon="CHECKMARK")
+            else:
+                box.label(text="✓ 渲染完成(点 ⬇ 下载)", icon="CHECKMARK")
+        elif it.status == "failed":
+            err = it.error or "failed"
+            box.label(text=err[:68], icon="ERROR")
+            if len(err) > 68:
+                box.label(text=err[68:136])
+        elif it.status == "cancelled":
+            box.label(text="已取消", icon="X")
+        if it.warnings:
+            n = it.warnings.count(";") + 1
+            box.label(text=f"⚠ 外部资产断链 {n} 处: {it.warnings[:56]}…",
+                      icon="LIBRARY_DATA_BROKEN")
 
 
 _CLASSES = (FARM_PT_panel,)

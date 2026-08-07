@@ -10,6 +10,25 @@ class FarmError(RuntimeError):
     pass
 
 
+class _ProgressReader:
+    """包装上传文件对象:urllib 逐块 read 时统计已发送字节回调进度(cb 在网络线程被调)。"""
+
+    def __init__(self, f, total: int, cb):
+        self._f, self._total, self._cb, self._sent = f, total, cb, 0
+
+    def read(self, n: int = -1):
+        chunk = self._f.read(n)
+        self._sent += len(chunk)
+        try:
+            self._cb(self._sent, self._total)
+        except Exception:
+            pass
+        return chunk
+
+    def close(self):
+        self._f.close()
+
+
 class FarmClient:
     def __init__(self, endpoint_base: str, key: str, timeout: int = 60):
         """endpoint_base 形如 https://<workspace>--blender-bridge(farm_deploy 打印的)。"""
@@ -51,13 +70,17 @@ class FarmClient:
     def health(self) -> dict:
         return self._get("health", timeout=15)
 
-    def upload(self, filepath: str, name: str) -> dict:
-        """流式上传 .blend,返回 {blend_path, size_bytes}。大文件给长超时。"""
+    def upload(self, filepath: str, name: str, progress_cb=None) -> dict:
+        """流式上传 .blend,返回 {blend_path, size_bytes}。大文件给长超时。
+        progress_cb(sent_bytes, total_bytes) 每个网络块回调一次(网络线程)。"""
         p = Path(filepath)
         size = p.stat().st_size
         qs = urllib.parse.urlencode({"key": self.key, "name": name})
+        src = open(p, "rb")
+        if progress_cb:
+            src = _ProgressReader(src, size, progress_cb)
         req = urllib.request.Request(
-            f"{self._url('upload')}?{qs}", data=open(p, "rb"), method="POST",
+            f"{self._url('upload')}?{qs}", data=src, method="POST",
             headers={"Content-Type": "application/octet-stream",
                      "Content-Length": str(size)})
         try:
@@ -91,7 +114,7 @@ class FarmClient:
         return self._post("cancel", {"job_id": job_id}, timeout=30)
 
     def fetch(self, job_id: str, volume_path: str, dest_path: str,
-              delete_remote: bool = True) -> int:
+              delete_remote: bool = True, progress_cb=None) -> int:
         qs = urllib.parse.urlencode({"job_id": job_id, "path": volume_path,
                                      "key": self.key, "delete": int(delete_remote)})
         dest = Path(dest_path)
@@ -99,10 +122,16 @@ class FarmClient:
         try:
             with urllib.request.urlopen(f"{self._url('fetch')}?{qs}", timeout=600) as r, \
                     open(dest, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
                 size = 0
                 while chunk := r.read(1 << 20):
                     f.write(chunk)
                     size += len(chunk)
+                    if progress_cb:
+                        try:
+                            progress_cb(size, total)
+                        except Exception:
+                            pass
                 return size
         except urllib.error.HTTPError as e:
             raise FarmError(f"fetch HTTP {e.code}({volume_path})") from None

@@ -10,6 +10,8 @@ import bpy
 _RESULTS: queue.Queue = queue.Queue()   # 闭包队列:主线程 timer 逐个执行
 _POLLING = set()                        # 正在轮询中的 job_id(防重复起线程)
 _TIMER_ON = False
+_XFER: dict = {}                        # 传输进度:job 键 → (sent_bytes, total_bytes)。
+                                        # 网络线程高频写(每块),timer 低频读 → UI,零锁
 
 
 class FarmJobItem(bpy.types.PropertyGroup):
@@ -25,6 +27,9 @@ class FarmJobItem(bpy.types.PropertyGroup):
     out_dir: bpy.props.StringProperty()        # 下载目录(绝对路径)
     downloaded: bpy.props.BoolProperty(default=False)
     outputs_json: bpy.props.StringProperty(default="[]")   # 终态 outputs(下载用)
+    xfer_sent: bpy.props.IntProperty(default=0)    # 上传/下载已传 MB(进度条)
+    xfer_total: bpy.props.IntProperty(default=0)   # 上传/下载总量 MB
+    gpu: bpy.props.StringProperty()                # 云端分配的 GPU(status 回传)
 
 
 def prefs():
@@ -58,6 +63,12 @@ def _tick():
             _RESULTS.get_nowait()()
         except Exception as e:
             print(f"[farm] result 处理失败: {e}")
+    # 1.5) 传输进度:网络线程写 _XFER,这里搬进 item 字段(MB)供进度条
+    for it in bpy.context.window_manager.farm_jobs:
+        if it.status in ("uploading", "downloading"):
+            prog = _XFER.get(it.job_id)
+            if prog:
+                it.xfer_sent, it.xfer_total = prog[0] >> 20, max(1, prog[1] >> 20)
     # 2) 对活跃 job 起轮询线程(在跑的不重复起;uploading 由提交线程自己推进,
     #    local- 前缀 = 还没拿到云端 id,不可查)
     active = [it.job_id for it in bpy.context.window_manager.farm_jobs
@@ -102,6 +113,8 @@ def _poll_once(job_id: str):
         if s.get("_poll_error"):
             return   # 网络抖动:保持现状,下个 tick 再试
         it.status = s.get("status") or it.status
+        if s.get("gpu"):
+            it.gpu = str(s["gpu"])
         p = s.get("progress") or {}
         if p:
             it.step, it.total = p.get("step", it.step), p.get("total", it.total)

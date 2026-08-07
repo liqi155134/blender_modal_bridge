@@ -128,9 +128,11 @@ class FARM_OT_submit(bpy.types.Operator):
         jobs.ensure_timer()
 
         def work():
+            def on_up(sent, total, _k=local_key):
+                jobs._XFER[_k] = (sent, total)
             try:
                 c = jobs.get_client()
-                up = c.upload(tmp_path, name)
+                up = c.upload(tmp_path, name, progress_cb=on_up)
                 d = c.run(render, up["blend_path"])
             except Exception as e:
                 def fail():
@@ -141,6 +143,7 @@ class FARM_OT_submit(bpy.types.Operator):
                 jobs.push_result(fail)
                 return
             finally:
+                jobs._XFER.pop(local_key, None)
                 try:
                     os.remove(tmp_path)
                 except OSError:
@@ -200,12 +203,18 @@ def start_download(it):
 
     def work():
         err = None
+
+        def on_dl(sent, total, _k=jid):
+            jobs._XFER[_k] = (sent, total)
         try:
             c = jobs.get_client()
             for o in outputs:
-                c.fetch(jid, o["volume_path"], str(Path(out_dir) / o["filename"]))
+                c.fetch(jid, o["volume_path"], str(Path(out_dir) / o["filename"]),
+                        progress_cb=on_dl)
         except Exception as e:
             err = str(e)[:400]
+        finally:
+            jobs._XFER.pop(jid, None)
 
         def apply():
             it2 = jobs.find(jid)
