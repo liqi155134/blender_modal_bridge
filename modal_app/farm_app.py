@@ -58,7 +58,7 @@ farm_image = (
     # 运行时读的 env 必须烤进镜像(deploy 子进程的 env 只在部署解析期可见,不会自动进容器):
     #   APP_NAME/VOLUME/SECRET → 容器 re-import 本文件时顶层 from_name;FARM_GPU → 显示/health
     .env({k: os.environ[k] for k in (
-        "FARM_APP_NAME", "FARM_VOLUME", "FARM_SECRET", "FARM_GPU",
+        "FARM_APP_NAME", "FARM_VOLUME", "FARM_SECRET", "FARM_GPU", "FARM_VERSION",
     ) if os.environ.get(k)})
     .add_local_python_source("farm_app", "farm_common")
 )
@@ -191,15 +191,24 @@ def _configure_cycles_gpu() -> str:
             for d in prefs.devices:
                 d.use = (d.type != "CPU")
             scene.cycles.device = "GPU"
-            # 尊重场景的 denoise 开关,只把实现切到 OPTIX(硬件降噪)
-            if dtype == "OPTIX" and getattr(scene.cycles, "use_denoising", False):
-                scene.cycles.denoiser = "OPTIX"
             print(f"[farm] compute_device={dtype}: "
                   + ", ".join(d.name for d in prefs.devices if d.use))
+            _fix_denoiser(scene)
             return dtype
     print("[farm] ⚠ 未枚举到 GPU 设备,回退 CPU 渲染(慢)")
     scene.cycles.device = "CPU"
+    _fix_denoiser(scene)
     return "CPU"
+
+
+def _fix_denoiser(scene):
+    """OptiX denoiser 在 Modal 容器实测创建失败(2026-08-07 冒烟:渲染 device 走 OPTIX
+    正常,但 "Failed to create OptiX denoiser" 直接炸掉整帧)——场景若设了 OPTIX
+    denoiser,统一降级 OIDN(质量不输,GPU 版 4.1+ 可用)。denoise 开关本身尊重场景。"""
+    if getattr(scene.cycles, "use_denoising", False) and \
+            getattr(scene.cycles, "denoiser", "") == "OPTIX":
+        scene.cycles.denoiser = "OPENIMAGEDENOISE"
+        print("[farm] denoiser OPTIX → OPENIMAGEDENOISE(容器内 OptiX denoiser 不可用)")
 
 
 # 容器级场景缓存:key=job_id。同 job 分到本容器的所有帧只 open_mainfile 一次
