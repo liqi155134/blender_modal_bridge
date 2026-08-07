@@ -27,6 +27,15 @@ import modal
 
 import farm_common
 
+# fastapi 只在容器镜像里有(fastapi[standard]);部署解析侧(本地 python)没有 → 兜底 None。
+# upload_endpoint 的参数用字符串注解 "Request":容器运行时 FastAPI 用 get_type_hints
+# 解析到这里的真类才会注入 Request 对象 —— ⚠ 没有注解会被当 query 参数,端点直接 422
+# (2026-08-08 实锤:大文件上传表现为 Broken pipe,小请求才看得到 422 真身)。
+try:
+    from fastapi import Request
+except ModuleNotFoundError:
+    Request = None  # type: ignore[assignment,misc]
+
 APP_NAME = os.environ.get("FARM_APP_NAME", "blender-bridge")
 VOLUME_NAME = os.environ.get("FARM_VOLUME", "blender-bridge")
 SECRET_NAME = os.environ.get("FARM_SECRET", "blender-bridge-secrets")
@@ -384,7 +393,7 @@ def _check(key: str):
 @app.function(image=farm_image, volumes={"/vol": models_vol}, secrets=[farm_secret],
               timeout=1800)   # 大 .blend 慢速上行也够
 @modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-upload")
-async def upload_endpoint(request):
+async def upload_endpoint(request: "Request"):
     """流式收 .blend 写 Volume scenes/<sha1[:8]>_<name>。query: key, name。
     内容寻址命名:同内容同名秒过(文件已存在直接返回,不重写)。"""
     import hashlib
