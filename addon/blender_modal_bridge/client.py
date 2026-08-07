@@ -1,5 +1,6 @@
 """client.py — 云端 HTTP 客户端(纯 stdlib;所有方法阻塞,只允许在后台线程调用)。"""
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -7,7 +8,9 @@ from pathlib import Path
 
 
 class FarmError(RuntimeError):
-    pass
+    def __init__(self, msg: str, retryable: bool = False):
+        super().__init__(msg)
+        self.retryable = retryable   # 网络类瞬时错误(broken pipe/超时/5xx)可重试
 
 
 class _ProgressReader:
@@ -93,16 +96,27 @@ class FarmClient:
                     raise FarmError("上传已被用户取消")
                 chunk = f.read(self.UPLOAD_CHUNK)
                 base = index * self.UPLOAD_CHUNK
-                body = io.BytesIO(chunk)
-                if progress_cb:
-                    body = _ProgressReader(
-                        body, len(chunk),
-                        lambda sent, _t, _b=base: progress_cb(_b + sent, size))
                 qs = urllib.parse.urlencode({
                     "key": self.key, "name": name,
                     "upload_id": upload_id, "index": index, "total": total})
-                d = self._upload_request(qs, body, len(chunk),
-                                         what=f"块 {index + 1}/{total}")
+                # 块级重试(分块架构的核心收益):网络瞬断只重传这一块,不整单报废。
+                # 服务端同 upload_id+index 重写同文件,幂等安全。
+                for attempt in range(3):
+                    body = io.BytesIO(chunk)
+                    if progress_cb:
+                        body = _ProgressReader(
+                            body, len(chunk),
+                            lambda sent, _t, _b=base: progress_cb(_b + sent, size))
+                    try:
+                        d = self._upload_request(qs, body, len(chunk),
+                                                 what=f"块 {index + 1}/{total}")
+                        break
+                    except FarmError as e:
+                        if not e.retryable or attempt == 2:
+                            raise
+                        if cancel_check and cancel_check():
+                            raise FarmError("上传已被用户取消") from None
+                        time.sleep(2 * (attempt + 1))
         if not d or "blend_path" not in d:
             raise FarmError(f"分块上传收尾异常: {(d or {}).get('error') or d}")
         return d
@@ -129,11 +143,13 @@ class FarmClient:
             try:
                 d = json.loads(e.read().decode())
             except Exception:
-                raise FarmError(f"{what} HTTP {e.code}") from None
+                raise FarmError(f"{what} HTTP {e.code}",
+                                retryable=e.code >= 500) from None
         except Exception as e:
-            raise FarmError(f"{what} 失败: {e}") from e
+            # broken pipe / 超时 / 连接 reset 等网络瞬断:可重试
+            raise FarmError(f"{what} 失败: {e}", retryable=True) from e
         if "error" in d:
-            raise FarmError(f"{what}: {d['error']}")
+            raise FarmError(f"{what}: {d['error']}")   # 服务端语义错误:不重试
         return d
 
     def run(self, render: dict, blend_path: str | None) -> dict:
