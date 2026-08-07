@@ -390,41 +390,111 @@ def _check(key: str):
     return JSONResponse({"error": "unauthorized — bad or missing farm key"}, status_code=401)
 
 
-@app.function(image=farm_image, volumes={"/vol": models_vol}, secrets=[farm_secret],
-              timeout=1800)   # 大 .blend 慢速上行也够
-@modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-upload")
-async def upload_endpoint(request: "Request"):
-    """流式收 .blend 写 Volume scenes/<sha1[:8]>_<name>。query: key, name。
-    内容寻址命名:同内容同名秒过(文件已存在直接返回,不重写)。"""
+def _finalize_scene_file(tmp: Path, name: str, size: int) -> dict:
+    """临时文件 → 算 sha → 落 Volume scenes/<sha1[:8]>_<name>(内容寻址,已存在秒过)。"""
     import hashlib
-
-    from fastapi.responses import JSONResponse
-    deny = _check(request.query_params.get("key", ""))
-    if deny:
-        return deny
-    name = farm_common.safe_scene_name(request.query_params.get("name", ""))
-    if not name.endswith(".blend"):
-        return JSONResponse({"error": "只收 .blend 文件"}, status_code=400)
-    sha, size = hashlib.sha1(), 0
-    tmp = Path(f"/tmp/upload_{uuid.uuid4().hex}.blend")
-    with open(tmp, "wb") as f:
-        async for chunk in request.stream():
-            f.write(chunk)
+    sha = hashlib.sha1()
+    with open(tmp, "rb") as f:
+        while chunk := f.read(1 << 22):
             sha.update(chunk)
-            size += len(chunk)
-    if size < 128:   # .blend 头都不止这么大,基本是空/坏请求
-        tmp.unlink(missing_ok=True)
-        return JSONResponse({"error": f"上传内容过小({size}B),不是有效 .blend"}, status_code=400)
     blend_path = f"scenes/{sha.hexdigest()[:8]}_{name}"
     dest = Path("/vol") / blend_path
-    models_vol.reload()
-    if not dest.is_file():          # 同内容重复上传:秒过
+    if not dest.is_file():
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(tmp), dest)
         models_vol.commit()
     else:
         tmp.unlink(missing_ok=True)
     return {"blend_path": blend_path, "size_bytes": size}
+
+
+def _sweep_stale_uploads():
+    """清 24h 前的断头分块目录(上传中断的残留)。best-effort。"""
+    try:
+        updir = Path("/vol/uploads")
+        if not updir.is_dir():
+            return
+        now = time.time()
+        for d in updir.iterdir():
+            if d.is_dir() and now - d.stat().st_mtime > 86400:
+                shutil.rmtree(d, ignore_errors=True)
+        models_vol.commit()
+    except Exception:
+        pass
+
+
+@app.function(image=farm_image, volumes={"/vol": models_vol}, secrets=[farm_secret],
+              timeout=1800)   # 大块慢速上行也够
+@modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-upload")
+async def upload_endpoint(request: "Request"):
+    """收 .blend 写 Volume scenes/<sha1[:8]>_<name>(内容寻址,同内容秒过)。
+    两种模式(query 区分):
+      单发:?key&name                              —— body=整文件(⚠ Modal 单请求体实测
+           150MB OK / 700MB 被 303 拒,大文件必须走分块)
+      分块:?key&name&upload_id&index&total        —— 块暂存 Volume uploads/<id>/
+           (端点多请求不保证同容器,容器本地 /tmp 会丢块,必须经 Volume 中转);
+           客户端串行发块,收到末块时 reload 数块拼接落盘。"""
+    from fastapi.responses import JSONResponse
+    q = request.query_params
+    deny = _check(q.get("key", ""))
+    if deny:
+        return deny
+    name = farm_common.safe_scene_name(q.get("name", ""))
+    if not name.endswith(".blend"):
+        return JSONResponse({"error": "只收 .blend 文件"}, status_code=400)
+
+    upload_id = q.get("upload_id", "")
+    if not upload_id:
+        # ── 单发模式 ──
+        size = 0
+        tmp = Path(f"/tmp/upload_{uuid.uuid4().hex}.blend")
+        with open(tmp, "wb") as f:
+            async for chunk in request.stream():
+                f.write(chunk)
+                size += len(chunk)
+        if size < 128:   # .blend 头都不止这么大,基本是空/坏请求
+            tmp.unlink(missing_ok=True)
+            return JSONResponse({"error": f"上传内容过小({size}B)"}, status_code=400)
+        models_vol.reload()
+        return _finalize_scene_file(tmp, name, size)
+
+    # ── 分块模式 ──
+    if not (len(upload_id) == 32 and all(c in "0123456789abcdef" for c in upload_id)):
+        return JSONResponse({"error": "upload_id 必须是 32 位 hex(uuid4().hex)"}, status_code=400)
+    try:
+        index, total = int(q.get("index", -1)), int(q.get("total", 0))
+    except ValueError:
+        return JSONResponse({"error": "index/total 必须是整数"}, status_code=400)
+    if not (0 <= index < total <= 512):
+        return JSONResponse({"error": f"index/total 非法({index}/{total})"}, status_code=400)
+    updir = Path("/vol/uploads") / upload_id
+    updir.mkdir(parents=True, exist_ok=True)
+    part = updir / f"c_{index:05d}"
+    with open(part, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+    models_vol.commit()
+    if index < total - 1:
+        return {"ok": True, "received": index + 1, "total": total}
+    # 末块:客户端串行保证前面的块都已 commit → reload 后数块拼接
+    models_vol.reload()
+    parts = sorted(updir.glob("c_*"))
+    if len(parts) != total:
+        return JSONResponse({"error": f"分块不齐:{len(parts)}/{total}(重传整个文件)"},
+                            status_code=400)
+    tmp = Path(f"/tmp/merge_{upload_id}.blend")
+    size = 0
+    with open(tmp, "wb") as out:
+        for p in parts:
+            with open(p, "rb") as f:
+                while chunk := f.read(1 << 22):
+                    out.write(chunk)
+                    size += len(chunk)
+    result = _finalize_scene_file(tmp, name, size)
+    shutil.rmtree(updir, ignore_errors=True)
+    _sweep_stale_uploads()
+    models_vol.commit()
+    return result
 
 
 @app.function(image=farm_image, secrets=[farm_secret], timeout=60)

@@ -70,19 +70,55 @@ class FarmClient:
     def health(self) -> dict:
         return self._get("health", timeout=15)
 
+    # 单请求体上限:Modal 入口层实测 150MB 过、700MB 被 303 拒(具体阈值未公开)。
+    # 超过就切块串行发,服务端经 Volume 中转拼接 —— 96MB 留足余量。
+    UPLOAD_CHUNK = 96 << 20
+
     def upload(self, filepath: str, name: str, progress_cb=None) -> dict:
-        """流式上传 .blend,返回 {blend_path, size_bytes}。大文件给长超时。
-        progress_cb(sent_bytes, total_bytes) 每个网络块回调一次(网络线程)。"""
+        """上传 .blend,返回 {blend_path, size_bytes}。≤96MB 单发;更大自动分块串行。
+        progress_cb(sent_bytes, total_bytes) 按全局累计字节回调(网络线程)。"""
         p = Path(filepath)
         size = p.stat().st_size
+        if size <= self.UPLOAD_CHUNK:
+            return self._upload_once(p, name, size, progress_cb)
+        import io
+        import uuid
+        upload_id = uuid.uuid4().hex
+        total = (size + self.UPLOAD_CHUNK - 1) // self.UPLOAD_CHUNK
+        d = None
+        with open(p, "rb") as f:
+            for index in range(total):
+                chunk = f.read(self.UPLOAD_CHUNK)
+                base = index * self.UPLOAD_CHUNK
+                body = io.BytesIO(chunk)
+                if progress_cb:
+                    body = _ProgressReader(
+                        body, len(chunk),
+                        lambda sent, _t, _b=base: progress_cb(_b + sent, size))
+                qs = urllib.parse.urlencode({
+                    "key": self.key, "name": name,
+                    "upload_id": upload_id, "index": index, "total": total})
+                d = self._upload_request(qs, body, len(chunk),
+                                         what=f"块 {index + 1}/{total}")
+        if not d or "blend_path" not in d:
+            raise FarmError(f"分块上传收尾异常: {(d or {}).get('error') or d}")
+        return d
+
+    def _upload_once(self, p: Path, name: str, size: int, progress_cb) -> dict:
         qs = urllib.parse.urlencode({"key": self.key, "name": name})
         src = open(p, "rb")
         if progress_cb:
             src = _ProgressReader(src, size, progress_cb)
+        d = self._upload_request(qs, src, size, what="上传")
+        if "blend_path" not in d:
+            raise FarmError(f"upload 响应异常: {d.get('error') or d}")
+        return d
+
+    def _upload_request(self, qs: str, body, length: int, what: str) -> dict:
         req = urllib.request.Request(
-            f"{self._url('upload')}?{qs}", data=src, method="POST",
+            f"{self._url('upload')}?{qs}", data=body, method="POST",
             headers={"Content-Type": "application/octet-stream",
-                     "Content-Length": str(size)})
+                     "Content-Length": str(length)})
         try:
             with urllib.request.urlopen(req, timeout=1800) as r:
                 d = json.loads(r.read().decode())
@@ -90,11 +126,11 @@ class FarmClient:
             try:
                 d = json.loads(e.read().decode())
             except Exception:
-                raise FarmError(f"upload HTTP {e.code}") from None
+                raise FarmError(f"{what} HTTP {e.code}") from None
         except Exception as e:
-            raise FarmError(f"upload 失败: {e}") from e
-        if "blend_path" not in d:
-            raise FarmError(f"upload 响应异常: {d.get('error') or d}")
+            raise FarmError(f"{what} 失败: {e}") from e
+        if "error" in d:
+            raise FarmError(f"{what}: {d['error']}")
         return d
 
     def run(self, render: dict, blend_path: str | None) -> dict:
