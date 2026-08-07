@@ -347,3 +347,159 @@ def render_job(job: dict, job_id: str) -> dict:
         done_state["warnings"] = warnings   # 缺贴图等断链:渲完了,但用户必须看见
     job_state[job_id] = done_state
     return {"frames": total, "outputs": len(outputs)}
+
+
+# ============================================================================
+# 鉴权 — 自建 farm_key(私有端点)。部署时 farm_deploy.py 生成并写进 Secret,
+# key 经 query(GET ?key=)/ body(POST auth_key)传入;拒绝时返 401。
+# ============================================================================
+DEPLOYED_VERSION = os.environ.get("FARM_VERSION", "unknown")
+
+
+def _check(key: str):
+    expected = os.environ.get("FARM_API_KEY", "")
+    if expected and key == expected:
+        return None
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"error": "unauthorized — bad or missing farm key"}, status_code=401)
+
+
+@app.function(image=farm_image, volumes={"/vol": models_vol}, secrets=[farm_secret],
+              timeout=1800)   # 大 .blend 慢速上行也够
+@modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-upload")
+async def upload_endpoint(request):
+    """流式收 .blend 写 Volume scenes/<sha1[:8]>_<name>。query: key, name。
+    内容寻址命名:同内容同名秒过(文件已存在直接返回,不重写)。"""
+    import hashlib
+
+    from fastapi.responses import JSONResponse
+    deny = _check(request.query_params.get("key", ""))
+    if deny:
+        return deny
+    name = farm_common.safe_scene_name(request.query_params.get("name", ""))
+    if not name.endswith(".blend"):
+        return JSONResponse({"error": "只收 .blend 文件"}, status_code=400)
+    sha, size = hashlib.sha1(), 0
+    tmp = Path(f"/tmp/upload_{uuid.uuid4().hex}.blend")
+    with open(tmp, "wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            sha.update(chunk)
+            size += len(chunk)
+    if size < 128:   # .blend 头都不止这么大,基本是空/坏请求
+        tmp.unlink(missing_ok=True)
+        return JSONResponse({"error": f"上传内容过小({size}B),不是有效 .blend"}, status_code=400)
+    blend_path = f"scenes/{sha.hexdigest()[:8]}_{name}"
+    dest = Path("/vol") / blend_path
+    models_vol.reload()
+    if not dest.is_file():          # 同内容重复上传:秒过
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp), dest)
+        models_vol.commit()
+    else:
+        tmp.unlink(missing_ok=True)
+    return {"blend_path": blend_path, "size_bytes": size}
+
+
+@app.function(image=farm_image, secrets=[farm_secret], timeout=60)
+@modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-run")
+def run_endpoint(payload: dict):
+    """提交渲染 job。payload: {auth_key, task_type?, blend_path?, render:{…}, job_id?}。
+    blend_path 省略 = 内置 demo 场景(冒烟)。"""
+    deny = _check(payload.get("auth_key", ""))
+    if deny:
+        return deny
+    job, err = farm_common.normalize_job(payload)
+    if err:
+        return {"error": err}
+    job_id = payload.get("job_id") or str(uuid.uuid4())
+    _sweep_job_state()
+    job_state[job_id] = {"status": "queued", "queued_at": time.time(),
+                         "gpu": FARM_GPU, "task_type": job["task_type"]}
+    call = render_job.spawn(job, job_id)
+    # call_id 存独立 key:job_state[job_id] 同时被 worker 写(running/completed),Modal Dict
+    # 跨容器最终一致,merge 回写会撞 stale 覆盖 —— 分 key 各写各的,无竞态。
+    job_state[f"{job_id}:call"] = call.object_id
+    return {"id": job_id, "status": "queued", "gpu": FARM_GPU}
+
+
+@app.function(image=farm_image, secrets=[farm_secret], timeout=10)
+@modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-status")
+def status_endpoint(job_id: str, key: str = ""):
+    deny = _check(key)
+    if deny:
+        return deny
+    s = job_state.get(job_id)
+    if not s:
+        return {"error": "job not found", "id": job_id}
+    return {"id": job_id, **s}
+
+
+@app.function(image=farm_image, secrets=[farm_secret], timeout=60)
+@modal.fastapi_endpoint(method="POST", label=f"{APP_NAME}-cancel")
+def cancel_endpoint(payload: dict):
+    deny = _check(payload.get("auth_key", ""))
+    if deny:
+        return deny
+    job_id = payload.get("job_id")
+    if not job_id:
+        return {"error": "Missing 'job_id'"}
+    s = job_state.get(job_id) or {}
+    was_running = s.get("status") == "running"
+    call_id = job_state.get(f"{job_id}:call")
+    if call_id:
+        try:
+            modal.FunctionCall.from_id(call_id).cancel()
+        except Exception as e:
+            # 取消失败绝不能谎报成功:云端还在跑、还在计费,必须让调用方看见
+            print(f"[farm] cancel call {call_id} FAILED: {e}")
+            return {"id": job_id, "status": s.get("status") or "unknown",
+                    "error": f"cancel failed: {e}", "was_running": was_running}
+    # coordinator 被杀后已 spawn 的帧不会自动停 —— 连带取消(滑动窗口保证 ≤ ~20 个)
+    for cid in (job_state.get(f"{job_id}:subcalls") or []):
+        try:
+            modal.FunctionCall.from_id(cid).cancel()
+        except Exception as e:
+            print(f"[farm] cancel subcall {cid} failed: {e}")
+    job_state[job_id] = {**s, "status": "cancelled", "completed_at": time.time()}
+    return {"id": job_id, "status": "cancelled", "was_running": was_running}
+
+
+@app.function(image=farm_image, volumes={"/vol": models_vol}, secrets=[farm_secret],
+              timeout=600)
+@modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-fetch")
+def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0):
+    """流式取回产物。path 必须在 _outputs/<job_id>/ 内(囚笼,拒绝逃逸);
+    delete=1 → 发送完成后删文件并 commit(默认删:产物取回即清,Volume 不堆积)。"""
+    deny = _check(key)
+    if deny:
+        return deny
+    from fastapi.responses import FileResponse, JSONResponse
+    from starlette.background import BackgroundTask
+    prefix = f"_outputs/{job_id}/"
+    if not path.startswith(prefix) or ".." in path or path != os.path.normpath(path):
+        return JSONResponse({"error": "path out of job scope"}, status_code=403)
+    models_vol.reload()   # worker 完成时 commit 过;reload 确保本容器看得到
+    local = Path("/vol") / path
+    if not local.is_file():
+        return JSONResponse({"error": f"not found: {path}"}, status_code=404)
+    cleanup = None
+    if delete:
+        def _cleanup(p=str(local)):
+            try:
+                os.remove(p)
+                models_vol.commit()
+            except Exception as e:
+                print(f"[farm] fetch cleanup {p} failed: {e}")
+        cleanup = BackgroundTask(_cleanup)
+    return FileResponse(str(local), filename=Path(path).name, background=cleanup)
+
+
+@app.function(image=farm_image, secrets=[farm_secret], timeout=10)
+@modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-health")
+def health_endpoint(key: str = ""):
+    deny = _check(key)
+    if deny:
+        return deny
+    return {"healthy": True, "app": APP_NAME, "gpu": FARM_GPU,
+            "bpy": BPY_VERSION, "version": DEPLOYED_VERSION}
