@@ -1,4 +1,4 @@
-# blender_farm 设计文档（Blender 云端渲染农场）
+# blender_modal_bridge 设计文档（Blender 云端渲染农场）
 
 日期:2026-08-07 · 状态:已与用户对齐,待实施
 决策链:独立新项目(与 comfyui_modal_bridge 零耦合)→ Blender addon + N 面板 UI → HTTP 直传自建端点 → MVP=渲染、二期=烘焙贴图(协议预留 task_type)
@@ -14,20 +14,20 @@
 ## 2. 总体架构
 
 ```
-Mac Blender 5.2 (addon UI)                Modal 云端 (独立 app: blender-farm)
+Mac Blender 5.2 (addon UI)                Modal 云端 (独立 app: blender-bridge)
 ┌─────────────────────────┐    HTTPS     ┌──────────────────────────────────┐
-│ N 面板: 提交/进度/取回     │ ──upload──→ │ upload 端点 → Volume blender-farm │
+│ N 面板: 提交/进度/取回     │ ──upload──→ │ upload 端点 → Volume blender-bridge│
 │ pack 副本 + 本地预检       │ ──run─────→ │ coordinator(CPU) 滑动窗口分片      │
 │ 后台线程 + timer 轮询      │ ←─status──  │   └→ render_frame(L40S,OPTIX)×N  │
 │ 结果下载 //render_farm/    │ ←─fetch───  │ 产物 _outputs/<job>/ (mp4|zip)    │
 └─────────────────────────┘              └──────────────────────────────────┘
 ```
 
-仓库布局(`/workspace/documents/blender_farm/`,经挂载 Mac 可见,addon 可直接从挂载目录装载):
+仓库布局(`/workspace/documents/blender_modal_bridge/`,经挂载 Mac 可见,addon 可直接从挂载目录装载;项目名与 comfyui_modal_bridge 平行,内部模块保留 farm_* 短前缀指"渲染农场功能"):
 
 ```
-blender_farm/
-├── addon/blender_farm/        # Blender addon(Mac 侧,纯 stdlib,零第三方依赖)
+blender_modal_bridge/
+├── addon/blender_modal_bridge/  # Blender addon(Mac 侧,纯 stdlib,零第三方依赖)
 │   ├── __init__.py            # bl_info、注册
 │   ├── client.py              # HTTP 客户端(urllib;upload/run/status/cancel/fetch)
 │   ├── ops.py                 # operators(提交/取消/下载;后台线程 + 队列)
@@ -45,7 +45,7 @@ blender_farm/
 
 ### 3.1 资源与鉴权
 
-- 独立 Modal app `blender-farm`、Volume `blender-farm`(场景 `scenes/`、产物 `_outputs/`)、Secret `blender-farm-secrets`(存 `FARM_API_KEY`)、Dict `blender-farm-jobs`(job 状态,终态 TTL 1h + 数量上限清扫,连带 `:call`/`:subcalls` key)
+- 独立 Modal app `blender-bridge`(与 comfyui-bridge 平行命名)、Volume `blender-bridge`(场景 `scenes/`、产物 `_outputs/`)、Secret `blender-bridge-secrets`(存 `FARM_API_KEY`)、Dict `blender-bridge-jobs`(job 状态,终态 TTL 1h + 数量上限清扫,连带 `:call`/`:subcalls` key)
 - 鉴权:自建 `farm_key`(部署时随机生成进 Secret;GET `?key=` / POST body `auth_key`),全部端点校验
 
 ### 3.2 镜像
