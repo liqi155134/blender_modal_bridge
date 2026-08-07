@@ -176,6 +176,8 @@ def _missing_files() -> list[str]:
             if not Path(bpy.path.abspath(img.filepath)).exists():
                 missing.append(f"image: {img.filepath}")
     for lib in bpy.data.libraries:
+        if not lib.users_id:
+            continue   # 空壳库引用(链接块已全删):不参与渲染,不报
         if lib.filepath and not Path(bpy.path.abspath(lib.filepath)).exists():
             missing.append(f"library: {lib.filepath}")
     return missing[:20]   # 封顶,别撑爆 job_state

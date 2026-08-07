@@ -47,6 +47,8 @@ def _precheck_missing() -> list[str]:
             if not Path(bpy.path.abspath(img.filepath)).exists():
                 missing.append(f"image: {img.filepath}")
     for lib in bpy.data.libraries:
+        if not lib.users_id:
+            continue   # 空壳库引用(链接的数据块已全被删/purge):不参与渲染,不报
         missing.append(f"library(不会打包,云端必缺): {lib.filepath}")
     return missing
 
