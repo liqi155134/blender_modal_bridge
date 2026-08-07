@@ -18,11 +18,13 @@ def test_normalize_defaults():
 
 
 def test_normalize_task_type_gate():
-    """MVP 只认 render;bake 等二期类型给明确报错而非静默当 render。"""
-    _, err = fc.normalize_job({"task_type": "bake"})
-    assert err and "bake" in err
+    """render/bake 合法;未知类型明确报错而非静默当 render。"""
+    _, err = fc.normalize_job({"task_type": "simulate"})
+    assert err and "simulate" in err
     job, err = fc.normalize_job({"task_type": "render"})
     assert err is None
+    job, err = fc.normalize_job({"task_type": "bake", "bake": {"objects": ["Cube"]}})
+    assert err is None and job["task_type"] == "bake"
 
 
 def test_normalize_blend_path_jail():
