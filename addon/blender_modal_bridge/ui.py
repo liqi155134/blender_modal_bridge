@@ -62,7 +62,7 @@ class FARM_PT_panel(bpy.types.Panel):
         if sc.render.engine != "CYCLES":
             col.label(text=f"引擎是 {sc.render.engine},农场只支持 Cycles", icon="ERROR")
 
-        lay.operator("farm.submit", icon="CLOUD")
+        lay.operator("farm.submit", icon="RENDER_ANIMATION")  # ⚠ 别用 "CLOUD":5.2 无此图标,draw 会中断
         row = lay.row(align=True)
         row.operator("farm.test_connection", icon="PLUGIN")
         row.operator("farm.clear_finished", icon="TRASH")
