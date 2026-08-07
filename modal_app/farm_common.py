@@ -10,6 +10,9 @@ import re
 
 MAX_FRAMES = 2000       # 单 job 帧数上限:cancel 窗口可控 + 并行费用护栏
 MAX_FRAME_NO = 99999    # 帧号上限:产物文件名 %05d,超了字典序乱、ffmpeg glob 顺序错
+# bake pass 白名单(常用 PBR 集;DIFFUSE 由 worker 自动关 direct/indirect = albedo)
+BAKE_PASSES = ("NORMAL", "AO", "DIFFUSE", "ROUGHNESS", "EMIT", "COMBINED")
+MAX_BAKE_UNITS = 256    # 单 job 上限:对象数 × pass 数(费用护栏)
 
 
 def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
@@ -20,14 +23,16 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
     if not isinstance(payload, dict):
         return None, "payload 必须是对象"
     task_type = str(payload.get("task_type") or "render").lower()
-    if task_type != "render":
-        return None, f"task_type={task_type!r} 暂未支持(MVP 只有 render;bake 二期)"
+    if task_type not in ("render", "bake"):
+        return None, f"task_type={task_type!r} 暂未支持(可用: render / bake)"
     blend_path = payload.get("blend_path")
     if blend_path is not None:
         norm = os.path.normpath(str(blend_path)).replace("\\", "/")
         if (not isinstance(blend_path, str) or not blend_path.startswith("scenes/")
                 or ".." in blend_path or blend_path != norm):
             return None, "blend_path 必须是 Volume 上 scenes/ 下的相对路径(由 /upload 返回)"
+    if task_type == "bake":
+        return _normalize_bake(payload.get("bake") or {}, blend_path)
     r = payload.get("render") or {}
     if not isinstance(r, dict):
         return None, "render 必须是对象"
@@ -93,6 +98,73 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
             return None, "camera 必须是非空字符串(场景里的相机对象名)"
         job["camera"] = cam.strip()
     return job, None
+
+
+def _normalize_bake(b: dict, blend_path) -> tuple[dict | None, str | None]:
+    """bake 参数校验 → 扁平 job。对象 × pass 是并行单元。"""
+    if not isinstance(b, dict):
+        return None, "bake 必须是对象"
+    objects = b.get("objects")
+    if (not isinstance(objects, list) or not objects
+            or not all(isinstance(o, str) and o.strip() for o in objects)):
+        return None, "objects 必填:要烘焙的对象名列表(非空字符串)"
+    if len(objects) > 128:
+        return None, "objects 最多 128 个"
+    objects = [o.strip() for o in objects]
+    raw_passes = b.get("passes") or ["NORMAL", "AO"]
+    passes = []
+    for p in raw_passes:
+        p = str(p).upper()
+        if p not in BAKE_PASSES:
+            return None, f"pass {p!r} 不支持(可用: {', '.join(BAKE_PASSES)})"
+        if p not in passes:
+            passes.append(p)
+    n = len(objects) * len(passes)
+    if n > MAX_BAKE_UNITS:
+        return None, f"单 job 最多 {MAX_BAKE_UNITS} 个烘焙单元(对象×pass;现 {n});请分批提交"
+    fmt = str(b.get("file_format") or "PNG").upper()
+    if fmt not in ("PNG", "OPEN_EXR"):
+        return None, "file_format 只能是 PNG 或 OPEN_EXR"
+    job = {"task_type": "bake", "blend_path": blend_path,
+           "objects": objects, "passes": passes,
+           "selected_to_active": bool(b.get("selected_to_active", False)),
+           "file_format": fmt}
+    try:
+        res = int(b.get("resolution", 2048))
+        margin = int(b.get("margin", 16))
+        cage = float(b.get("cage_extrusion", 0.0))
+        ray = float(b.get("max_ray_distance", 0.0))
+    except (TypeError, ValueError):
+        return None, "resolution/margin 必须是整数,cage_extrusion/max_ray_distance 必须是数"
+    if not 64 <= res <= 8192:
+        return None, "resolution 范围 64..8192"
+    if not 1 <= margin <= 64:
+        return None, "margin 范围 1..64"
+    if cage < 0 or ray < 0:
+        return None, "cage_extrusion / max_ray_distance 必须 ≥ 0"
+    job.update(resolution=res, margin=margin, cage_extrusion=cage, max_ray_distance=ray)
+    samples = b.get("samples")
+    if samples is not None:
+        try:
+            samples = int(samples)
+        except (TypeError, ValueError):
+            return None, "samples 必须是整数"
+        if samples < 1:
+            return None, "samples 必须 ≥ 1"
+        job["samples"] = samples
+    return job, None
+
+
+def bake_units(job: dict) -> list[tuple[str, str]]:
+    """bake job → (object, pass) 并行单元列表(顺序稳定:对象外层、pass 内层)。"""
+    return [(o, p) for o in job["objects"] for p in job["passes"]]
+
+
+def high_name(low: str) -> str | None:
+    """`<name>_low` → `<name>_high`(高低模命名约定,只换最后一个后缀);不含 _low 返回 None。"""
+    if low.endswith("_low"):
+        return low[: -len("_low")] + "_high"
+    return None
 
 
 def frames_list(job: dict) -> list[int]:

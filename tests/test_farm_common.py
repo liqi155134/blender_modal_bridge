@@ -104,6 +104,56 @@ def test_normalize_frames_spec():
     assert err  # 帧号上限仍生效
 
 
+def test_bake_normalize_defaults():
+    """bake 最小 payload:objects 必填,其余默认。"""
+    job, err = fc.normalize_job({"task_type": "bake", "bake": {"objects": ["Cube"]}})
+    assert err is None
+    assert job["task_type"] == "bake" and job["objects"] == ["Cube"]
+    assert job["passes"] == ["NORMAL", "AO"] and job["resolution"] == 2048
+    assert job["margin"] == 16 and job["selected_to_active"] is False
+    assert job["file_format"] == "PNG"
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {}})
+    assert err  # objects 必填
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {"objects": []}})
+    assert err
+
+
+def test_bake_pass_whitelist_and_units():
+    job, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A", "B"], "passes": ["NORMAL", "DIFFUSE", "NORMAL"]}})
+    assert err is None and job["passes"] == ["NORMAL", "DIFFUSE"]   # 去重保序
+    assert fc.bake_units(job) == [("A", "NORMAL"), ("A", "DIFFUSE"),
+                                  ("B", "NORMAL"), ("B", "DIFFUSE")]
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "passes": ["GLOSSY_WRONG"]}})
+    assert err
+    many = [f"o{i}" for i in range(60)]   # 60×6=360 > 256
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": many, "passes": list(fc.BAKE_PASSES)}})
+    assert err and str(fc.MAX_BAKE_UNITS) in err
+
+
+def test_bake_param_validation():
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "resolution": 32}})
+    assert err   # 分辨率 64..8192
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "margin": 0}})
+    assert err
+    job, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "selected_to_active": True, "cage_extrusion": 0.05}})
+    assert err is None and job["cage_extrusion"] == 0.05
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "cage_extrusion": -1}})
+    assert err
+
+
+def test_high_name():
+    assert fc.high_name("Cube_low") == "Cube_high"
+    assert fc.high_name("Cube") is None
+    assert fc.high_name("x_low_low") == "x_low_high"   # 只换最后一个后缀
+
+
 def test_safe_scene_name():
     assert fc.safe_scene_name("My Scene (v2).blend") == "My_Scene__v2_.blend"
     assert fc.safe_scene_name("../../../etc/passwd") == "passwd"
