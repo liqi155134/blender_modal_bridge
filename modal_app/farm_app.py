@@ -284,57 +284,99 @@ def render_frame(job: dict, frame: int, job_id: str) -> dict:
 
 
 # ============================================================================
-# coordinator — 分帧调度 + 进度 + 合成/打包 + job_state 终态
+# coordinator — 滑动窗口调度(render/bake 共用)+ 各自的产物打包 + job_state 终态
 # ============================================================================
-@app.function(image=farm_image, volumes={"/vol": models_vol}, timeout=JOB_TIMEOUT)
-def render_job(job: dict, job_id: str) -> dict:
-    """滑动窗口 spawn 逐帧渲染:in-flight ≤ 2×MAX_PARALLEL。为什么不 starmap/全量 spawn:
+def _await_call_key(job_id: str):
+    """等 run 端点把 :call 写进来(cancel 可用的前提),等不到也继续。"""
+    for _ in range(50):
+        if job_state.get(f"{job_id}:call"):
+            return
+        time.sleep(0.1)
+
+
+def _sliding_schedule(spawn_one, units: list, job_id: str, t0: float):
+    """滑动窗口 spawn 并行单元:in-flight ≤ 2×MAX_PARALLEL。为什么不 starmap/全量 spawn:
       - cancel 需要逐个取消子 call(coordinator 被 cancel 后已 spawn 的 input 不会自动停),
         窗口把「要取消的 id 数」封顶在 ~20 个,cancel 端点的 RPC 循环才跑得完;
-      - 未 spawn 的帧不产生任何排队/费用,任务中途失败即止损。"""
+      - 未 spawn 的单元不产生任何排队/费用,任务中途失败即止损。
+    spawn_one(unit) -> FunctionCall。返回 (results, warnings, device)。
+    进度按完成单元数写 job_state.progress(render=帧,bake=对象×pass)。"""
     from collections import OrderedDict, deque
-    for _ in range(50):   # 等 run 端点把 :call 写进来(cancel 可用的前提),等不到也继续
-        if job_state.get(f"{job_id}:call"):
-            break
-        time.sleep(0.1)
+    window = max(2, MAX_PARALLEL * 2)
+    pending = deque(units)
+    inflight: OrderedDict = OrderedDict()   # FunctionCall -> unit(FIFO)
+    total = len(units)
+    done, warnings, device = 0, [], None
+    results = []
+
+    def _fill():
+        while pending and len(inflight) < window:
+            u = pending.popleft()
+            inflight[spawn_one(u)] = u
+        try:   # 滚动上报 in-flight 子 call,cancel 端点据此连带取消;写失败不碰任务
+            job_state[f"{job_id}:subcalls"] = [c.object_id for c in inflight]
+        except Exception:
+            pass
+
+    _fill()
+    while inflight:
+        call, _u = next(iter(inflight.items()))
+        r = call.get()               # FIFO 等最老的;单元异常 → 整个 job fail(调用方 except)
+        inflight.pop(call)
+        results.append(r)
+        done += 1
+        if r.get("warnings") and not warnings:
+            warnings = r["warnings"]     # 同一场景警告全同,存一份
+        device = r.get("device") or device
+        elapsed = time.time() - t0
+        try:
+            job_state[job_id] = {**job_state.get(job_id, {}), "progress": {
+                "step": done, "total": total,
+                "s_it": round(elapsed / done, 1), "elapsed": int(elapsed)}}
+        except Exception:
+            pass
+        _fill()
+    return results, warnings, device
+
+
+def _fail_job(job_id: str, e: Exception):
+    """coordinator 失败收尾:止损取消子 call + 写 failed 终态(cancelled 不覆盖)。"""
+    import traceback
+    tb = traceback.format_exc()
+    for cid in (job_state.get(f"{job_id}:subcalls") or []):   # 止损:停掉还在烧卡的单元
+        try:
+            modal.FunctionCall.from_id(cid).cancel()
+        except Exception:
+            pass
+    cur = job_state.get(job_id) or {}
+    if cur.get("status") == "cancelled":
+        # cancel 端点已写终态;本异常只是取消传播(subcall 被 cancel → get() 抛
+        # "Function call was cancelled…")——别用 failed + SDK 吓人文案覆盖用户的取消
+        return
+    job_state[job_id] = {**cur, "status": "failed",
+                         "error": str(e), "trace": tb[-2000:],
+                         "completed_at": time.time()}
+
+
+def _complete_job(job_id: str, outputs: list, warnings: list, device):
+    done_state = {**job_state.get(job_id, {}), "status": "completed", "outputs": outputs,
+                  "render_device": device, "completed_at": time.time()}
+    if warnings:
+        done_state["warnings"] = warnings   # 缺贴图等断链:跑完了,但用户必须看见
+    job_state[job_id] = done_state
+
+
+@app.function(image=farm_image, volumes={"/vol": models_vol}, timeout=JOB_TIMEOUT)
+def render_job(job: dict, job_id: str) -> dict:
+    """渲染 coordinator:逐帧并行 → ffmpeg 合成 mp4 / zip 帧序列。"""
+    _await_call_key(job_id)
     frames = farm_common.frames_list(job)
-    total = len(frames)
     t0 = time.time()
     job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": t0,
-                         "progress": {"step": 0, "total": total, "elapsed": 0}}
+                         "progress": {"step": 0, "total": len(frames), "elapsed": 0}}
     try:
-        window = max(2, MAX_PARALLEL * 2)
-        pending = deque(frames)
-        inflight: OrderedDict = OrderedDict()   # FunctionCall -> frame(FIFO)
-        done, warnings, device = 0, [], None
-
-        def _fill():
-            while pending and len(inflight) < window:
-                f = pending.popleft()
-                inflight[render_frame.spawn(job, f, job_id)] = f
-            try:   # 滚动上报 in-flight 子 call,cancel 端点据此连带取消;写失败不碰任务
-                job_state[f"{job_id}:subcalls"] = [c.object_id for c in inflight]
-            except Exception:
-                pass
-
-        _fill()
-        while inflight:
-            call, _f = next(iter(inflight.items()))
-            r = call.get()               # FIFO 等最老的;单帧异常 → 整个 job fail(进 except)
-            inflight.pop(call)
-            done += 1
-            if r.get("warnings") and not warnings:
-                warnings = r["warnings"]     # 同一场景警告全同,存一份
-            device = r.get("device") or device
-            elapsed = time.time() - t0
-            try:
-                job_state[job_id] = {**job_state.get(job_id, {}), "progress": {
-                    "step": done, "total": total,
-                    "s_it": round(elapsed / done, 1), "elapsed": int(elapsed)}}
-            except Exception:
-                pass
-            _fill()
-
+        _results, warnings, device = _sliding_schedule(
+            lambda f: render_frame.spawn(job, f, job_id), frames, job_id, t0)
         # ── 合成 / 打包(帧此刻全在 Volume;先 reload 看到其它容器 commit 的文件)──
         models_vol.reload()
         out_root = Path(f"/vol/_outputs/{job_id}")
@@ -360,28 +402,154 @@ def render_job(job: dict, job_id: str) -> dict:
                         "size_bytes": (out_root / "frames.zip").stat().st_size}]
         models_vol.commit()
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        for cid in (job_state.get(f"{job_id}:subcalls") or []):   # 止损:停掉还在烧卡的帧
-            try:
-                modal.FunctionCall.from_id(cid).cancel()
-            except Exception:
-                pass
-        cur = job_state.get(job_id) or {}
-        if cur.get("status") == "cancelled":
-            # cancel 端点已写终态;本异常只是取消传播(subcall 被 cancel → get() 抛
-            # "Function call was cancelled…")——别用 failed + SDK 吓人文案覆盖用户的取消
-            raise
-        job_state[job_id] = {**cur, "status": "failed",
-                             "error": str(e), "trace": tb[-2000:],
-                             "completed_at": time.time()}
+        _fail_job(job_id, e)
         raise
-    done_state = {**job_state.get(job_id, {}), "status": "completed", "outputs": outputs,
-                  "render_device": device, "completed_at": time.time()}
-    if warnings:
-        done_state["warnings"] = warnings   # 缺贴图等断链:渲完了,但用户必须看见
-    job_state[job_id] = done_state
-    return {"frames": total, "outputs": len(outputs)}
+    _complete_job(job_id, outputs, warnings, device)
+    return {"frames": len(frames), "outputs": len(outputs)}
+
+
+# ============================================================================
+# bake — 单对象×单 pass 的 GPU 单元 + coordinator
+# ============================================================================
+def _safe_unit_name(name: str) -> str:
+    """对象名 → 产物文件名安全片段(防路径注入;中文保留)。"""
+    import re
+    return re.sub(r"[/\\\x00-\x1f]", "_", name).strip() or "obj"
+
+
+@app.function(
+    gpu=FARM_GPU,
+    image=farm_image,
+    volumes={"/vol": models_vol},
+    timeout=FRAME_TIMEOUT,
+    max_containers=MAX_PARALLEL,
+)
+def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
+    """烘焙单个 (对象, pass),写 Volume _outputs/<job_id>/textures/<obj>_<pass>.<ext>。
+    场景缓存 key=job_id 同渲染;bake 与渲染共用 Cycles PT 内核(同吃 OPTIX/RT core)。"""
+    ext = "exr" if job["file_format"] == "OPEN_EXR" else "png"
+    fname = f"{_safe_unit_name(obj_name)}_{pass_type}.{ext}"
+    final = Path(f"/vol/_outputs/{job_id}/textures/{fname}")
+    if final.is_file() and final.stat().st_size > 0:   # 幂等:重跑不重烘
+        return {"unit": f"{obj_name}:{pass_type}", "path": str(final), "skipped": True,
+                "size": final.stat().st_size, "secs": 0.0,
+                "warnings": _SCENE["warnings"], "device": _SCENE["device"]}
+    import bpy
+    if _SCENE["key"] != job_id:
+        models_vol.reload()
+        if job.get("blend_path"):
+            p = Path("/vol") / job["blend_path"]
+            if not p.is_file():
+                raise FileNotFoundError(f".blend 不在 Volume 上: {job['blend_path']}")
+            bpy.ops.wm.open_mainfile(filepath=str(p))
+        else:
+            _build_demo_scene()
+        if job.get("samples"):
+            bpy.context.scene.cycles.samples = job["samples"]
+        _SCENE["warnings"] = _missing_files()
+        _SCENE["device"] = _configure_cycles_gpu()
+        _SCENE["key"] = job_id
+    scene = bpy.context.scene
+    obj = bpy.data.objects.get(obj_name)
+    if obj is None or obj.type != "MESH":
+        meshes = [o.name for o in bpy.data.objects if o.type == "MESH"][:20]
+        raise ValueError(f"找不到网格对象 {obj_name!r}(场景里的网格: {meshes})")
+    if not obj.data.uv_layers:
+        raise ValueError(f"{obj_name!r} 没有 UV —— bake 需要已展好的 UV(场景是真源)")
+
+    # 目标 image:每个材质槽都要挂 active image node —— 冒烟实锤:空槽的面被静默跳过
+    img_name = f"farm_bake_{obj_name}_{pass_type}"
+    img = bpy.data.images.get(img_name)
+    if img is None:
+        img = bpy.data.images.new(img_name, job["resolution"], job["resolution"],
+                                  float_buffer=(job["file_format"] == "OPEN_EXR"))
+    if pass_type in ("NORMAL", "ROUGHNESS", "AO"):
+        img.colorspace_settings.name = "Non-Color"   # 数据贴图不走 sRGB
+    if not obj.material_slots:
+        mat = bpy.data.materials.new(f"farm_bake_{obj_name}")
+        mat.use_nodes = True
+        obj.data.materials.append(mat)
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat is None:
+            mat = bpy.data.materials.new(f"farm_bake_{obj_name}_slot")
+            mat.use_nodes = True
+            slot.material = mat
+        if not mat.use_nodes:
+            mat.use_nodes = True
+        nt = mat.node_tree
+        node = next((n for n in nt.nodes if n.type == "TEX_IMAGE" and n.image == img), None)
+        if node is None:
+            node = nt.nodes.new("ShaderNodeTexImage")
+            node.image = img
+        nt.nodes.active = node
+        node.select = True
+
+    # context:低模 active(+高模 selected,s2a 模式按 _low/_high 命名配对)
+    bpy.ops.object.select_all(action="DESELECT")
+    s2a = job["selected_to_active"]
+    if s2a:
+        high = farm_common.high_name(obj_name)
+        if not high:
+            raise ValueError(f"selected_to_active 需要对象名以 _low 结尾"
+                             f"(配对 <name>_high),收到 {obj_name!r}")
+        hobj = bpy.data.objects.get(high)
+        if hobj is None:
+            raise ValueError(f"找不到高模 {high!r}(命名约定 <name>_low / <name>_high)")
+        hobj.select_set(True)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+    if pass_type == "DIFFUSE":   # albedo only:关光照分量
+        scene.render.bake.use_pass_direct = False
+        scene.render.bake.use_pass_indirect = False
+    kwargs = dict(type=pass_type, margin=job["margin"])
+    if s2a:
+        kwargs.update(use_selected_to_active=True,
+                      cage_extrusion=job["cage_extrusion"],
+                      max_ray_distance=job["max_ray_distance"])
+    t0 = time.time()
+    bpy.ops.object.bake(**kwargs)
+    tmp = Path(f"/tmp/{fname}")
+    img.filepath_raw = str(tmp)
+    img.file_format = job["file_format"]
+    img.save()
+    final.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(tmp, final)
+    tmp.unlink(missing_ok=True)
+    models_vol.commit()
+    return {"unit": f"{obj_name}:{pass_type}",
+            "path": f"_outputs/{job_id}/textures/{fname}",
+            "size": final.stat().st_size, "secs": round(time.time() - t0, 1),
+            "warnings": _SCENE["warnings"], "device": _SCENE["device"]}
+
+
+@app.function(image=farm_image, volumes={"/vol": models_vol}, timeout=JOB_TIMEOUT)
+def bake_job(job: dict, job_id: str) -> dict:
+    """bake coordinator:对象×pass 并行 → 全部完成后打 textures.zip。"""
+    _await_call_key(job_id)
+    units = farm_common.bake_units(job)
+    t0 = time.time()
+    job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": t0,
+                         "progress": {"step": 0, "total": len(units), "elapsed": 0}}
+    try:
+        _results, warnings, device = _sliding_schedule(
+            lambda u: bake_unit.spawn(job, u[0], u[1], job_id), units, job_id, t0)
+        models_vol.reload()
+        out_root = Path(f"/vol/_outputs/{job_id}")
+        tex_dir = out_root / "textures"
+        tmp_zip = shutil.make_archive(f"/tmp/{job_id}_textures", "zip", str(tex_dir))
+        shutil.copyfile(tmp_zip, out_root / "textures.zip")
+        shutil.rmtree(tex_dir, ignore_errors=True)   # 散图已打包,不占 Volume
+        outputs = [{"filename": "textures.zip",
+                    "volume_path": f"_outputs/{job_id}/textures.zip",
+                    "size_bytes": (out_root / "textures.zip").stat().st_size}]
+        models_vol.commit()
+    except Exception as e:
+        _fail_job(job_id, e)
+        raise
+    _complete_job(job_id, outputs, warnings, device)
+    return {"units": len(units), "outputs": len(outputs)}
 
 
 # ============================================================================
@@ -521,7 +689,8 @@ def run_endpoint(payload: dict):
     _sweep_job_state()
     job_state[job_id] = {"status": "queued", "queued_at": time.time(),
                          "gpu": FARM_GPU, "task_type": job["task_type"]}
-    call = render_job.spawn(job, job_id)
+    coordinator = bake_job if job["task_type"] == "bake" else render_job
+    call = coordinator.spawn(job, job_id)
     # call_id 存独立 key:job_state[job_id] 同时被 worker 写(running/completed),Modal Dict
     # 跨容器最终一致,merge 回写会撞 stale 覆盖 —— 分 key 各写各的,无竞态。
     job_state[f"{job_id}:call"] = call.object_id
