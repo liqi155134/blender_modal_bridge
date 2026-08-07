@@ -170,6 +170,8 @@ def _missing_files() -> list[str]:
     import bpy
     missing = []
     for img in bpy.data.images:
+        if img.users - int(img.use_fake_user) <= 0:
+            continue   # 孤儿数据块(无引用):与渲染无关,别报着吓人
         if img.source == "FILE" and img.filepath and not img.packed_file:
             if not Path(bpy.path.abspath(img.filepath)).exists():
                 missing.append(f"image: {img.filepath}")

@@ -36,9 +36,13 @@ def _frames_label(render: dict) -> str:
 
 
 def _precheck_missing() -> list[str]:
-    """本地预检:pack 不进去的外部资产(比云端更早暴露)。链接库必警告——不会上云。"""
+    """本地预检:pack 不进去的外部资产(比云端更早暴露)。链接库必警告——不会上云。
+    跳过孤儿数据块(users=0,无任何材质引用):迁移残留的死数据与渲染无关,
+    报出来纯属吓人(2026-08-08 用户 swan 工程实锤 3 个 C4D 残留 roughness 贴图误报)。"""
     missing = []
     for img in bpy.data.images:
+        if img.users - int(img.use_fake_user) <= 0:
+            continue
         if img.source == "FILE" and img.filepath and not img.packed_file:
             if not Path(bpy.path.abspath(img.filepath)).exists():
                 missing.append(f"image: {img.filepath}")
