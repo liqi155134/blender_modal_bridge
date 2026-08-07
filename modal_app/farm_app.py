@@ -251,3 +251,99 @@ def render_frame(job: dict, frame: int, job_id: str) -> dict:
     return {"frame": frame, "path": f"_outputs/{job_id}/frames/{final.name}",
             "size": final.stat().st_size, "secs": round(time.time() - t0, 1),
             "warnings": _SCENE["warnings"], "device": _SCENE["device"]}
+
+
+# ============================================================================
+# coordinator — 分帧调度 + 进度 + 合成/打包 + job_state 终态
+# ============================================================================
+@app.function(image=farm_image, volumes={"/vol": models_vol}, timeout=JOB_TIMEOUT)
+def render_job(job: dict, job_id: str) -> dict:
+    """滑动窗口 spawn 逐帧渲染:in-flight ≤ 2×MAX_PARALLEL。为什么不 starmap/全量 spawn:
+      - cancel 需要逐个取消子 call(coordinator 被 cancel 后已 spawn 的 input 不会自动停),
+        窗口把「要取消的 id 数」封顶在 ~20 个,cancel 端点的 RPC 循环才跑得完;
+      - 未 spawn 的帧不产生任何排队/费用,任务中途失败即止损。"""
+    from collections import OrderedDict, deque
+    for _ in range(50):   # 等 run 端点把 :call 写进来(cancel 可用的前提),等不到也继续
+        if job_state.get(f"{job_id}:call"):
+            break
+        time.sleep(0.1)
+    frames = farm_common.frames_list(job)
+    total = len(frames)
+    t0 = time.time()
+    job_state[job_id] = {**job_state.get(job_id, {}), "status": "running", "started_at": t0,
+                         "progress": {"step": 0, "total": total, "elapsed": 0}}
+    try:
+        window = max(2, MAX_PARALLEL * 2)
+        pending = deque(frames)
+        inflight: OrderedDict = OrderedDict()   # FunctionCall -> frame(FIFO)
+        done, warnings, device = 0, [], None
+
+        def _fill():
+            while pending and len(inflight) < window:
+                f = pending.popleft()
+                inflight[render_frame.spawn(job, f, job_id)] = f
+            try:   # 滚动上报 in-flight 子 call,cancel 端点据此连带取消;写失败不碰任务
+                job_state[f"{job_id}:subcalls"] = [c.object_id for c in inflight]
+            except Exception:
+                pass
+
+        _fill()
+        while inflight:
+            call, _f = next(iter(inflight.items()))
+            r = call.get()               # FIFO 等最老的;单帧异常 → 整个 job fail(进 except)
+            inflight.pop(call)
+            done += 1
+            if r.get("warnings") and not warnings:
+                warnings = r["warnings"]     # 同一场景警告全同,存一份
+            device = r.get("device") or device
+            elapsed = time.time() - t0
+            try:
+                job_state[job_id] = {**job_state.get(job_id, {}), "progress": {
+                    "step": done, "total": total,
+                    "s_it": round(elapsed / done, 1), "elapsed": int(elapsed)}}
+            except Exception:
+                pass
+            _fill()
+
+        # ── 合成 / 打包(帧此刻全在 Volume;先 reload 看到其它容器 commit 的文件)──
+        models_vol.reload()
+        out_root = Path(f"/vol/_outputs/{job_id}")
+        frames_dir = out_root / "frames"
+        if job["output"] == "video":
+            tmp_video = Path(f"/tmp/{job_id}.mp4")   # 产物先落本地盘,成功再拷 Volume
+            r = subprocess.run(farm_common.ffmpeg_cmd(str(frames_dir), str(tmp_video),
+                                                      job["fps"]),
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"ffmpeg 合成失败: {(r.stderr or '')[-800:]}")
+            shutil.copyfile(tmp_video, out_root / "render.mp4")
+            shutil.rmtree(frames_dir, ignore_errors=True)   # 散帧已合成,不占 Volume
+            outputs = [{"filename": "render.mp4",
+                        "volume_path": f"_outputs/{job_id}/render.mp4",
+                        "size_bytes": (out_root / "render.mp4").stat().st_size}]
+        else:
+            tmp_zip = shutil.make_archive(f"/tmp/{job_id}_frames", "zip", str(frames_dir))
+            shutil.copyfile(tmp_zip, out_root / "frames.zip")
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            outputs = [{"filename": "frames.zip",
+                        "volume_path": f"_outputs/{job_id}/frames.zip",
+                        "size_bytes": (out_root / "frames.zip").stat().st_size}]
+        models_vol.commit()
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        for cid in (job_state.get(f"{job_id}:subcalls") or []):   # 止损:停掉还在烧卡的帧
+            try:
+                modal.FunctionCall.from_id(cid).cancel()
+            except Exception:
+                pass
+        job_state[job_id] = {**job_state.get(job_id, {}), "status": "failed",
+                             "error": str(e), "trace": tb[-2000:],
+                             "completed_at": time.time()}
+        raise
+    done_state = {**job_state.get(job_id, {}), "status": "completed", "outputs": outputs,
+                  "render_device": device, "completed_at": time.time()}
+    if warnings:
+        done_state["warnings"] = warnings   # 缺贴图等断链:渲完了,但用户必须看见
+    job_state[job_id] = done_state
+    return {"frames": total, "outputs": len(outputs)}
