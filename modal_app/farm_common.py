@@ -31,19 +31,30 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
     r = payload.get("render") or {}
     if not isinstance(r, dict):
         return None, "render 必须是对象"
-    try:
-        start = int(r.get("frame_start", 1))
-        end = int(r.get("frame_end", start))
-        step = int(r.get("frame_step", 1))
-    except (TypeError, ValueError):
-        return None, "frame_start / frame_end / frame_step 必须是整数"
-    if step < 1:
-        return None, "frame_step 必须 ≥ 1"
-    if end < start:
-        return None, "frame_end 必须 ≥ frame_start"
+    # 帧范围两种来源:frames(复合 spec 字符串,优先;补渲散帧用)或 frame_start/end/step 三元组
+    frames_spec = r.get("frames")
+    frames = None
+    if frames_spec is not None:
+        try:
+            frames = expand_frame_spec(str(frames_spec))
+        except ValueError as e:
+            return None, f'frames 无效(形如 "3, 5-10, 47-327:2"): {e}'
+        start, end, step = frames[0], frames[-1], 1   # 仅供显示;真帧列表走 frames_spec
+        n = len(frames)
+    else:
+        try:
+            start = int(r.get("frame_start", 1))
+            end = int(r.get("frame_end", start))
+            step = int(r.get("frame_step", 1))
+        except (TypeError, ValueError):
+            return None, "frame_start / frame_end / frame_step 必须是整数"
+        if step < 1:
+            return None, "frame_step 必须 ≥ 1"
+        if end < start:
+            return None, "frame_end 必须 ≥ frame_start"
+        n = len(range(start, end + 1, step))
     if start < 0 or end > MAX_FRAME_NO:
         return None, f"帧号范围 0..{MAX_FRAME_NO}"
-    n = len(range(start, end + 1, step))
     if n > MAX_FRAMES:
         return None, f"单 job 最多 {MAX_FRAMES} 帧(现 {n} 帧);请分段提交"
     output = str(r.get("output") or "video").lower()
@@ -63,6 +74,8 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
     job = {"task_type": task_type, "blend_path": blend_path,
            "frame_start": start, "frame_end": end, "frame_step": step,
            "output": output, "file_format": fmt, "fps": fps}
+    if frames_spec is not None:
+        job["frames_spec"] = str(frames_spec).strip()
     for k in ("resolution_x", "resolution_y", "resolution_percentage", "samples"):
         v = r.get(k)
         if v is None:
@@ -83,8 +96,27 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
 
 
 def frames_list(job: dict) -> list[int]:
-    """规范化后的 job → 要渲染的帧号列表。"""
+    """规范化后的 job → 要渲染的帧号列表(复合 spec 优先)。"""
+    if job.get("frames_spec"):
+        return expand_frame_spec(job["frames_spec"])
     return list(range(job["frame_start"], job["frame_end"] + 1, job["frame_step"]))
+
+
+def expand_frame_spec(spec: str) -> list[int]:
+    """复合帧范围 → 去重升序帧列表。"3, 5-10, 47-327:2":逗号分段,段=帧号|区间|区间:step。
+    补渲散帧(镜头返修)靠它。非法抛 ValueError。"""
+    s = str(spec).strip()
+    if not s:
+        raise ValueError("空 spec")
+    frames: set[int] = set()
+    for part in s.split(","):
+        start, end, step = parse_frame_spec(part)
+        if step < 1:
+            raise ValueError(f"step 必须 ≥ 1: {part.strip()!r}")
+        if end < start:
+            raise ValueError(f"区间尾 < 头: {part.strip()!r}")
+        frames.update(range(start, end + 1, step))
+    return sorted(frames)
 
 
 def parse_frame_spec(spec: str) -> tuple[int, int, int]:
@@ -108,7 +140,8 @@ def ffmpeg_cmd(frames_dir: str, out_path: str, fps: int) -> list[str]:
     pad 滤镜兜底奇数分辨率(yuv420p 要求偶数,场景分辨率是艺术家定的,不该因此失败)。"""
     return ["ffmpeg", "-y", "-framerate", str(fps), "-pattern_type", "glob",
             "-i", f"{frames_dir}/*.png",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            # crf 20 + 关键帧间隔 18:对齐 Flamenco 官方出片参数(x264 默认 crf23 偏低)
+            "-c:v", "libx264", "-crf", "20", "-g", "18", "-pix_fmt", "yuv420p",
             "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
             out_path]
 

@@ -13,8 +13,6 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE / "modal_app"))
-from farm_common import parse_frame_spec  # noqa: E402
 
 cfg = json.loads((HERE / "farm_config.json").read_text())
 BASE, KEY = cfg["endpoint"], cfg["farm_key"]
@@ -41,10 +39,9 @@ def main():
     ap.add_argument("--format", default="PNG", choices=["PNG", "OPEN_EXR"])
     ap.add_argument("--cancel-after", type=int, default=0)
     args = ap.parse_args()
-    start, end, step = parse_frame_spec(args.frames)
 
     print("health:", get("health"))
-    d = post("run", {"render": {"frame_start": start, "frame_end": end, "frame_step": step,
+    d = post("run", {"render": {"frames": args.frames,   # 复合 spec 直接透传("1,3-5,8:2")
                                 "output": args.output, "file_format": args.format}})
     if "id" not in d:
         sys.exit(f"提交失败: {d}")

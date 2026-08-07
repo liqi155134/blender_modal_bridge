@@ -2,6 +2,7 @@
 提交流程(全在后台线程,UI 不阻塞):pack 副本 → 本地预检 → upload → run → 转轮询。"""
 import json
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -12,19 +13,26 @@ from . import jobs
 
 
 def _scene_props(context):
-    """从 Scene 自定义属性读提交参数(ui.py 注册;fps 尊重场景)。"""
+    """从 Scene 自定义属性读提交参数(ui.py 注册;fps 尊重场景)。
+    CUSTOM 模式走复合帧 spec 字符串(补渲散帧),其余两档仍是三元组。"""
     sc = context.scene
+    fps = round(sc.render.fps / sc.render.fps_base)
+    base = {"output": sc.farm_output, "file_format": sc.farm_file_format, "fps": fps}
     mode = sc.farm_frame_mode
     if mode == "CURRENT":
-        start = end = sc.frame_current
-        step = 1
-    elif mode == "SCENE":
-        start, end, step = sc.frame_start, sc.frame_end, sc.frame_step
-    else:   # CUSTOM
-        start, end, step = sc.farm_frame_start, sc.farm_frame_end, sc.farm_frame_step
-    fps = round(sc.render.fps / sc.render.fps_base)
-    return {"frame_start": start, "frame_end": end, "frame_step": step,
-            "output": sc.farm_output, "file_format": sc.farm_file_format, "fps": fps}
+        return {**base, "frame_start": sc.frame_current, "frame_end": sc.frame_current,
+                "frame_step": 1}
+    if mode == "SCENE":
+        return {**base, "frame_start": sc.frame_start, "frame_end": sc.frame_end,
+                "frame_step": sc.frame_step}
+    return {**base, "frames": sc.farm_frames_spec}   # CUSTOM
+
+
+def _frames_label(render: dict) -> str:
+    """job 列表显示用的帧范围描述。"""
+    if render.get("frames"):
+        return str(render["frames"])
+    return f"{render['frame_start']}-{render['frame_end']}"
 
 
 def _precheck_missing() -> list[str]:
@@ -97,6 +105,11 @@ class FARM_OT_submit(bpy.types.Operator):
         if render["output"] == "video" and render["file_format"] != "PNG":
             self.report({"ERROR"}, "video 输出只支持 PNG;EXR 请切 output=frames")
             return {"CANCELLED"}
+        spec = render.get("frames")
+        if spec is not None and not re.fullmatch(r"[\d\s,:\-]+", spec or ""):
+            # 粗校验挡明显非法(细校验在云端);别等上传完才发现 spec 打错
+            self.report({"ERROR"}, f'帧范围形如 "3, 5-10, 47-327:2",收到 {spec!r}')
+            return {"CANCELLED"}
         # 主线程:pack + save copy(bpy.ops 必须主线程)
         tmp_path, warnings = _pack_and_save_copy()
         name = Path(bpy.data.filepath or "untitled.blend").name
@@ -106,7 +119,7 @@ class FARM_OT_submit(bpy.types.Operator):
         wm = context.window_manager
         it = wm.farm_jobs.add()
         it.job_id = f"local-{os.urandom(4).hex()}"   # 提交成功后换成云端 id
-        it.label = f"{name}  {render['frame_start']}-{render['frame_end']}"
+        it.label = f"{name}  {_frames_label(render)}"
         it.status = "uploading"
         if warnings:
             it.warnings = "; ".join(warnings)[:800]

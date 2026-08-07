@@ -77,6 +77,31 @@ def test_ffmpeg_cmd():
     s = " ".join(cmd)
     assert "-framerate 24" in s and "yuv420p" in s and "pad=" in s  # 奇数分辨率兜底
     assert "/v/_outputs/j1/frames/*.png" in s
+    assert "-crf 20" in s and "-g 18" in s  # 质量参数(对齐 Flamenco;x264 默认 crf23 偏低)
+
+
+def test_expand_frame_spec():
+    """复合帧范围(镜头返修补渲散帧):逗号分段,段=帧号|区间|区间:step;去重升序。"""
+    assert fc.expand_frame_spec("3, 5-10, 47-50") == [3, 5, 6, 7, 8, 9, 10, 47, 48, 49, 50]
+    assert fc.expand_frame_spec("1-10:3") == [1, 4, 7, 10]
+    assert fc.expand_frame_spec("7") == [7]
+    assert fc.expand_frame_spec("5, 3, 5-6") == [3, 5, 6]   # 去重 + 排序
+    for bad in ("", "a", "1-2:0", "5-1", "1-3,x"):
+        with pytest.raises(ValueError):
+            fc.expand_frame_spec(bad)
+
+
+def test_normalize_frames_spec():
+    """render.frames(复合 spec 字符串)优先于 frame_start/end/step。"""
+    job, err = fc.normalize_job({"render": {"frames": "1, 5-8"}})
+    assert err is None and fc.frames_list(job) == [1, 5, 6, 7, 8]
+    assert job["frames_spec"] == "1, 5-8"
+    _, err = fc.normalize_job({"render": {"frames": "bad"}})
+    assert err
+    _, err = fc.normalize_job({"render": {"frames": f"1-{fc.MAX_FRAMES + 1}"}})
+    assert err and str(fc.MAX_FRAMES) in err
+    _, err = fc.normalize_job({"render": {"frames": "99998-100001"}})
+    assert err  # 帧号上限仍生效
 
 
 def test_safe_scene_name():

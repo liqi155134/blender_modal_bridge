@@ -226,6 +226,14 @@ _SCENE = {"key": None, "warnings": [], "device": None}
 def render_frame(job: dict, frame: int, job_id: str) -> dict:
     """渲染单帧,写 Volume _outputs/<job_id>/frames/frame_%05d.<ext>,返回帧元数据。
     bpy 状态是进程级全局的 —— Modal function 默认一容器一 input 串行,天然安全。"""
+    ext0 = "exr" if job["file_format"] == "OPEN_EXR" else "png"
+    done = Path(f"/vol/_outputs/{job_id}/frames/frame_{frame:05d}.{ext0}")
+    if done.is_file() and done.stat().st_size > 0:
+        # 幂等:该帧已渲过(job 重跑/失败重试场景),跳过 —— Flamenco use_overwrite=False
+        # 思想在本架构的翻译。Volume 视图旧只会导致重复渲(无害),不会误跳。
+        return {"frame": frame, "path": f"_outputs/{job_id}/frames/{done.name}",
+                "size": done.stat().st_size, "secs": 0.0, "skipped": True,
+                "warnings": _SCENE["warnings"], "device": _SCENE["device"]}
     import bpy
     if _SCENE["key"] != job_id:
         # 首次(或换 job):同步 Volume 拿最新上传的 .blend(此时无打开文件,reload 安全)

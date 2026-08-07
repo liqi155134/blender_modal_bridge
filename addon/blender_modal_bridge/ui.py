@@ -10,10 +10,10 @@ def _scene_props():
         name="Frames", default="SCENE",
         items=[("SCENE", "Scene Range", "用场景的 frame_start/end/step"),
                ("CURRENT", "Current Frame", "只渲当前帧(look dev 快查)"),
-               ("CUSTOM", "Custom", "自定义范围")])
-    S.farm_frame_start = bpy.props.IntProperty(name="Start", default=1, min=0)
-    S.farm_frame_end = bpy.props.IntProperty(name="End", default=48, min=0)
-    S.farm_frame_step = bpy.props.IntProperty(name="Step", default=1, min=1)
+               ("CUSTOM", "Custom", "复合帧范围,如 3, 5-10, 47-327:2(补渲散帧)")])
+    S.farm_frames_spec = bpy.props.StringProperty(
+        name="Frames", default="1-48",
+        description='复合帧范围:"47" / "1-30" / "3, 5-10, 47-327:2"(逗号分段,:step 跳帧)')
     S.farm_output = bpy.props.EnumProperty(
         name="Output", default="video",
         items=[("video", "Video (mp4)", "帧渲完 ffmpeg 合成 mp4"),
@@ -25,8 +25,7 @@ def _scene_props():
 
 def _del_scene_props():
     S = bpy.types.Scene
-    for k in ("farm_frame_mode", "farm_frame_start", "farm_frame_end",
-              "farm_frame_step", "farm_output", "farm_file_format"):
+    for k in ("farm_frame_mode", "farm_frames_spec", "farm_output", "farm_file_format"):
         delattr(S, k)
 
 
@@ -56,10 +55,7 @@ class FARM_PT_panel(bpy.types.Panel):
         col = lay.column(align=True)
         col.prop(sc, "farm_frame_mode")
         if sc.farm_frame_mode == "CUSTOM":
-            row = col.row(align=True)
-            row.prop(sc, "farm_frame_start")
-            row.prop(sc, "farm_frame_end")
-            row.prop(sc, "farm_frame_step")
+            col.prop(sc, "farm_frames_spec")
         row = col.row(align=True)
         row.prop(sc, "farm_output", expand=True)
         col.prop(sc, "farm_file_format")
