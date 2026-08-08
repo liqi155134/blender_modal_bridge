@@ -55,6 +55,7 @@ def _build_task(context) -> tuple[dict | None, str | None]:
                 "file_format": sc.farm_bake_format}
         if sc.farm_bake_s2a:
             bake["cage_extrusion"] = sc.farm_bake_cage
+            bake["max_ray_distance"] = sc.farm_bake_ray
         return {"task_type": "bake", "bake": bake}, None
     render = _scene_props(context)
     if render["output"] == "video" and render["file_format"] != "PNG":
