@@ -488,6 +488,7 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
     # context:低模 active(+高模 selected,s2a 模式按 _low/_high 命名配对)
     bpy.ops.object.select_all(action="DESELECT")
     s2a = job["selected_to_active"]
+    hobj = None
     if s2a:
         high = farm_common.high_name(obj_name)
         if not high:
@@ -496,13 +497,28 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
         hobj = bpy.data.objects.get(high)
         if hobj is None:
             raise ValueError(f"找不到高模 {high!r}(命名约定 <name>_low / <name>_high)")
+
+    # 可见性隔离:场景里其余网格(叠放的其他 LOD 档/源模)会污染 AO 遮蔽
+    # 射线与 s2a 采样射线,烘前只留目标对(每 unit 重设全量状态,warm 容器安全)
+    keep = {obj.name} | ({hobj.name} if hobj else set())
+    for other in bpy.data.objects:
+        if other.type == "MESH":
+            other.hide_render = other.name not in keep
+    for target in filter(None, (obj, hobj)):
+        target.hide_render = False
+        target.hide_viewport = False
+        target.hide_set(False)   # 隐藏对象无法 select,烘不了
+
+    if hobj is not None:
         hobj.select_set(True)
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
 
-    if pass_type == "DIFFUSE":   # albedo only:关光照分量
-        scene.render.bake.use_pass_direct = False
-        scene.render.bake.use_pass_indirect = False
+    # albedo only:DIFFUSE 关光照分量。⚠ 必须双向显式设置——warm 容器
+    # 场景状态跨 unit 存活,DIFFUSE 设 False 不复原会污染后续 COMBINED
+    is_diffuse = pass_type == "DIFFUSE"
+    scene.render.bake.use_pass_direct = not is_diffuse
+    scene.render.bake.use_pass_indirect = not is_diffuse
     kwargs = dict(type=pass_type, margin=job["margin"])
     if s2a:
         kwargs.update(use_selected_to_active=True,
@@ -742,9 +758,11 @@ def cancel_endpoint(payload: dict):
 @app.function(image=farm_image, volumes={"/vol": models_vol}, secrets=[farm_secret],
               timeout=600)
 @modal.fastapi_endpoint(method="GET", label=f"{APP_NAME}-fetch")
-def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0):
+def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0,
+                   delete_only: int = 0):
     """流式取回产物。path 必须在 _outputs/<job_id>/ 内(囚笼,拒绝逃逸);
-    delete=1 → 发送完成后删文件并 commit(默认删:产物取回即清,Volume 不堆积)。"""
+    delete=1 → 发送完成后删文件并 commit;
+    delete_only=1 → 不传输只删除(客户端原子落盘成功后再清远端)。"""
     deny = _check(key)
     if deny:
         return deny
@@ -757,6 +775,13 @@ def fetch_endpoint(job_id: str, path: str, key: str = "", delete: int = 0):
     local = Path("/vol") / path
     if not local.is_file():
         return JSONResponse({"error": f"not found: {path}"}, status_code=404)
+    if delete_only:
+        try:
+            os.remove(local)
+            models_vol.commit()
+            return {"deleted": path}
+        except Exception as e:
+            return JSONResponse({"error": f"delete failed: {e}"}, status_code=500)
     cleanup = None
     if delete:
         def _cleanup(p=str(local)):

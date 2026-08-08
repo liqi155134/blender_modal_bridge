@@ -172,6 +172,10 @@ class FARM_OT_submit(bpy.types.Operator):
                 c = jobs.get_client()
                 up = c.upload(tmp_path, name, progress_cb=on_up,
                               cancel_check=lambda: local_key in jobs._CANCEL_UPLOAD)
+                # 上传返回后、run 前必须再查一次取消:单发路径与最后一块
+                # 传输期间的取消都落在这里兜住,否则云端照跑照计费
+                if local_key in jobs._CANCEL_UPLOAD:
+                    raise RuntimeError("上传已被用户取消")
                 d = c.run(task, up["blend_path"])
             except Exception as e:
                 # ⚠ 必须在 except 块内先取值:Python 会在块退出时 del e,

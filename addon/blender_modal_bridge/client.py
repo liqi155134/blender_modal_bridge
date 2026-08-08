@@ -1,5 +1,6 @@
 """client.py — 云端 HTTP 客户端(纯 stdlib;所有方法阻塞,只允许在后台线程调用)。"""
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -84,6 +85,8 @@ class FarmClient:
         p = Path(filepath)
         size = p.stat().st_size
         if size <= self.UPLOAD_CHUNK:
+            if cancel_check and cancel_check():
+                raise FarmError("上传已被用户取消")
             return self._upload_once(p, name, size, progress_cb)
         import io
         import uuid
@@ -140,11 +143,16 @@ class FarmClient:
             with urllib.request.urlopen(req, timeout=1800) as r:
                 d = json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
+            # ⚠ HTTP 错误状态永远不落成功路径:5xx 可重试、4xx 语义错不重试。
+            # body 解析只为取错误详情(503 的 {"detail":...} 曾被当成功响应)。
+            detail = ""
             try:
-                d = json.loads(e.read().decode())
+                body = json.loads(e.read().decode())
+                detail = str(body.get("error") or body.get("detail") or body)[:300]
             except Exception:
-                raise FarmError(f"{what} HTTP {e.code}",
-                                retryable=e.code >= 500) from None
+                pass
+            msg = f"{what} HTTP {e.code}" + (f": {detail}" if detail else "")
+            raise FarmError(msg, retryable=e.code >= 500) from None
         except Exception as e:
             # broken pipe / 超时 / 连接 reset 等网络瞬断:可重试
             raise FarmError(f"{what} 失败: {e}", retryable=True) from e
@@ -172,13 +180,16 @@ class FarmClient:
 
     def fetch(self, job_id: str, volume_path: str, dest_path: str,
               delete_remote: bool = True, progress_cb=None) -> int:
+        """原子下载:先写 .part 临时文件、校验大小、os.replace 落位,
+        成功后才发 delete_only 清远端 —— 中断不留残缺产物、不丢远端数据。"""
         qs = urllib.parse.urlencode({"job_id": job_id, "path": volume_path,
-                                     "key": self.key, "delete": int(delete_remote)})
+                                     "key": self.key, "delete": 0})
         dest = Path(dest_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
         try:
             with urllib.request.urlopen(f"{self._url('fetch')}?{qs}", timeout=600) as r, \
-                    open(dest, "wb") as f:
+                    open(tmp, "wb") as f:
                 total = int(r.headers.get("Content-Length") or 0)
                 size = 0
                 while chunk := r.read(1 << 20):
@@ -189,6 +200,19 @@ class FarmClient:
                             progress_cb(size, total)
                         except Exception:
                             pass
-                return size
+            if total and size != total:
+                raise FarmError(f"fetch 大小不符: {size}/{total}({volume_path})",
+                                retryable=True)
+            os.replace(tmp, dest)
         except urllib.error.HTTPError as e:
             raise FarmError(f"fetch HTTP {e.code}({volume_path})") from None
+        finally:
+            tmp.unlink(missing_ok=True)
+        if delete_remote:
+            try:   # 清理失败无害(Volume 里多躺一份),不影响下载结果
+                qs2 = urllib.parse.urlencode({"job_id": job_id, "path": volume_path,
+                                              "key": self.key, "delete_only": 1})
+                urllib.request.urlopen(f"{self._url('fetch')}?{qs2}", timeout=30).read()
+            except Exception:
+                pass
+        return size
