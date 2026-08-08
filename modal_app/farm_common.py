@@ -5,6 +5,7 @@ farm_common.py — 提交协议的纯函数层(校验 / 帧列表 / ffmpeg 命�
 单测三方共用。协议改动先改这里的校验再动别处。
 task_type 从第一版就存在:MVP 只实现 render,二期 bake 时这里加分支,骨架不动。
 """
+import math
 import os
 import re
 
@@ -110,7 +111,7 @@ def _normalize_bake(b: dict, blend_path) -> tuple[dict | None, str | None]:
         return None, "objects 必填:要烘焙的对象名列表(非空字符串)"
     if len(objects) > 128:
         return None, "objects 最多 128 个"
-    objects = [o.strip() for o in objects]
+    objects = list(dict.fromkeys(o.strip() for o in objects))   # 去重保序:重复对象=并发写同一输出
     raw_passes = b.get("passes") or ["NORMAL", "AO"]
     passes = []
     for p in raw_passes:
@@ -125,9 +126,17 @@ def _normalize_bake(b: dict, blend_path) -> tuple[dict | None, str | None]:
     fmt = str(b.get("file_format") or "PNG").upper()
     if fmt not in ("PNG", "OPEN_EXR"):
         return None, "file_format 只能是 PNG 或 OPEN_EXR"
+    s2a = b.get("selected_to_active", False)
+    if not isinstance(s2a, bool):   # bool("false") is True —— 字符串一律拒绝
+        return None, "selected_to_active 必须是布尔值"
+    extra = b.get("visible_extra") or []
+    if (not isinstance(extra, list) or len(extra) > 64
+            or not all(isinstance(o, str) and o.strip() for o in extra)):
+        return None, "visible_extra 须是对象名列表(≤64,非空字符串)"
     job = {"task_type": "bake", "blend_path": blend_path,
            "objects": objects, "passes": passes,
-           "selected_to_active": bool(b.get("selected_to_active", False)),
+           "selected_to_active": s2a,
+           "visible_extra": [o.strip() for o in extra],
            "file_format": fmt}
     try:
         res = int(b.get("resolution", 2048))
@@ -140,6 +149,8 @@ def _normalize_bake(b: dict, blend_path) -> tuple[dict | None, str | None]:
         return None, "resolution 范围 64..8192"
     if not 1 <= margin <= 64:
         return None, "margin 范围 1..64"
+    if not (math.isfinite(cage) and math.isfinite(ray)):
+        return None, "cage_extrusion / max_ray_distance 必须是有限数"
     if cage < 0 or ray < 0:
         return None, "cage_extrusion / max_ray_distance 必须 ≥ 0"
     job.update(resolution=res, margin=margin, cage_extrusion=cage, max_ray_distance=ray)

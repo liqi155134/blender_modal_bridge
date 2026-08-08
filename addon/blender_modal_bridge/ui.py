@@ -29,6 +29,10 @@ def _scene_props():
     S.farm_bake_ray = bpy.props.FloatProperty(
         name="Max Ray Distance", default=0.0, min=0.0, precision=3,
         description="s2a 采样射线最大距离(0=不限;空壳件建议 ≈2×cage 防采到对面壁)")
+    S.farm_bake_visible_extra = bpy.props.StringProperty(
+        name="Visible Extra", default="",
+        description="烘焙时额外保持可见的对象名(逗号分隔)。用于接触遮蔽参照:"
+                    "相邻部件的高模等。默认只有目标对可见")
     S.farm_bake_format = bpy.props.EnumProperty(
         name="Format", default="PNG",
         items=[("PNG", "PNG", ""), ("OPEN_EXR", "OpenEXR", "")])
@@ -54,7 +58,8 @@ def _del_scene_props():
     for k in ("farm_task", "farm_bake_normal", "farm_bake_ao", "farm_bake_diffuse",
               "farm_bake_roughness", "farm_bake_emit", "farm_bake_combined",
               "farm_bake_resolution", "farm_bake_margin", "farm_bake_s2a",
-              "farm_bake_cage", "farm_bake_ray", "farm_bake_format",
+              "farm_bake_cage", "farm_bake_ray", "farm_bake_visible_extra",
+              "farm_bake_format",
               "farm_frame_mode", "farm_frames_spec", "farm_output", "farm_file_format"):
         delattr(S, k)
 
@@ -102,6 +107,7 @@ class FARM_PT_panel(bpy.types.Panel):
             if sc.farm_bake_s2a:
                 col.prop(sc, "farm_bake_cage")
                 col.prop(sc, "farm_bake_ray")
+            col.prop(sc, "farm_bake_visible_extra")
         else:
             col.prop(sc, "farm_frame_mode")
             if sc.farm_frame_mode == "CUSTOM":

@@ -448,6 +448,9 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
             bpy.context.scene.cycles.samples = job["samples"]
         _SCENE["warnings"] = _missing_files()
         _SCENE["device"] = _configure_cycles_gpu()
+        # 场景加载即捕获 bake 分量基线(供非 DIFFUSE pass 恢复,场景是真源)
+        _SCENE["bake_direct"] = bpy.context.scene.render.bake.use_pass_direct
+        _SCENE["bake_indirect"] = bpy.context.scene.render.bake.use_pass_indirect
         _SCENE["key"] = job_id
     scene = bpy.context.scene
     obj = bpy.data.objects.get(obj_name)
@@ -498,9 +501,11 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
         if hobj is None:
             raise ValueError(f"找不到高模 {high!r}(命名约定 <name>_low / <name>_high)")
 
-    # 可见性隔离:场景里其余网格(叠放的其他 LOD 档/源模)会污染 AO 遮蔽
-    # 射线与 s2a 采样射线,烘前只留目标对(每 unit 重设全量状态,warm 容器安全)
-    keep = {obj.name} | ({hobj.name} if hobj else set())
+    # 可见性隔离:场景里叠放的其他 LOD 档/源模会污染 AO 遮蔽射线与 s2a 采样。
+    # 每 unit 只留 目标对 + visible_extra(显式声明的接触遮蔽参照,如相邻部件的
+    # 高模)——多部件接触 AO 靠 visible_extra 传名,不再默认全场景可见。
+    keep = {obj.name} | ({hobj.name} if hobj else set()) \
+        | set(job.get("visible_extra") or [])
     for other in bpy.data.objects:
         if other.type == "MESH":
             other.hide_render = other.name not in keep
@@ -514,11 +519,15 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
 
-    # albedo only:DIFFUSE 关光照分量。⚠ 必须双向显式设置——warm 容器
-    # 场景状态跨 unit 存活,DIFFUSE 设 False 不复原会污染后续 COMBINED
-    is_diffuse = pass_type == "DIFFUSE"
-    scene.render.bake.use_pass_direct = not is_diffuse
-    scene.render.bake.use_pass_indirect = not is_diffuse
+    # albedo only:DIFFUSE 关光照分量。⚠ warm 容器场景状态跨 unit 存活,
+    # 非 DIFFUSE pass 恢复"场景加载时的基线"(不是硬编码 True——场景是真源,
+    # 艺术家有意关掉的分量必须尊重)
+    if pass_type == "DIFFUSE":
+        scene.render.bake.use_pass_direct = False
+        scene.render.bake.use_pass_indirect = False
+    else:
+        scene.render.bake.use_pass_direct = _SCENE.get("bake_direct", True)
+        scene.render.bake.use_pass_indirect = _SCENE.get("bake_indirect", True)
     kwargs = dict(type=pass_type, margin=job["margin"])
     if s2a:
         kwargs.update(use_selected_to_active=True,
@@ -611,6 +620,9 @@ def _sweep_stale_uploads():
         for d in updir.iterdir():
             if d.is_dir() and now - d.stat().st_mtime > 86400:
                 shutil.rmtree(d, ignore_errors=True)
+            elif d.is_file() and d.name.startswith("done_") \
+                    and now - d.stat().st_mtime > 86400:
+                d.unlink(missing_ok=True)
         models_vol.commit()
     except Exception:
         pass
@@ -660,6 +672,12 @@ async def upload_endpoint(request: "Request"):
         return JSONResponse({"error": "index/total 必须是整数"}, status_code=400)
     if not (0 <= index < total <= 512):
         return JSONResponse({"error": f"index/total 非法({index}/{total})"}, status_code=400)
+    # 幂等回放:末块成功但响应在网络中丢失 → 客户端重传末块。
+    # 合并完成时留 done 标记,任何针对已完成 upload_id 的块直接回放原结果。
+    done_marker = Path("/vol/uploads") / f"done_{upload_id}.json"
+    models_vol.reload()
+    if done_marker.is_file():
+        return json.loads(done_marker.read_text())
     updir = Path("/vol/uploads") / upload_id
     updir.mkdir(parents=True, exist_ok=True)
     part = updir / f"c_{index:05d}"
@@ -684,6 +702,8 @@ async def upload_endpoint(request: "Request"):
                     out.write(chunk)
                     size += len(chunk)
     result = _finalize_scene_file(tmp, name, size)
+    if isinstance(result, dict):   # 成功才留幂等标记(JSONResponse=失败,可整体重传)
+        done_marker.write_text(json.dumps(result))
     shutil.rmtree(updir, ignore_errors=True)
     _sweep_stale_uploads()
     models_vol.commit()
@@ -701,7 +721,8 @@ def run_endpoint(payload: dict):
     job, err = farm_common.normalize_job(payload)
     if err:
         return {"error": err}
-    job_id = payload.get("job_id") or str(uuid.uuid4())
+    # job_id 一律服务端生成:外部值可拼路径逃逸 _outputs 囚笼(../scenes 等)
+    job_id = str(uuid.uuid4())
     _sweep_job_state()
     job_state[job_id] = {"status": "queued", "queued_at": time.time(),
                          "gpu": FARM_GPU, "task_type": job["task_type"]}
@@ -746,11 +767,18 @@ def cancel_endpoint(payload: dict):
             return {"id": job_id, "status": s.get("status") or "unknown",
                     "error": f"cancel failed: {e}", "was_running": was_running}
     # coordinator 被杀后已 spawn 的帧不会自动停 —— 连带取消(滑动窗口保证 ≤ ~20 个)
+    sub_failed = []
     for cid in (job_state.get(f"{job_id}:subcalls") or []):
         try:
             modal.FunctionCall.from_id(cid).cancel()
         except Exception as e:
             print(f"[farm] cancel subcall {cid} failed: {e}")
+            sub_failed.append(cid)
+    if sub_failed:
+        # 子任务取消失败同样不能谎报:GPU 可能还在跑、还在计费
+        return {"id": job_id, "status": s.get("status") or "unknown",
+                "error": f"{len(sub_failed)} 个子任务取消失败(仍可能在计费),"
+                         f"稍后重试 cancel", "was_running": was_running}
     job_state[job_id] = {**s, "status": "cancelled", "completed_at": time.time()}
     return {"id": job_id, "status": "cancelled", "was_running": was_running}
 

@@ -160,3 +160,30 @@ def test_safe_scene_name():
     assert fc.safe_scene_name("My Scene (v2).blend") == "My_Scene__v2_.blend"
     assert fc.safe_scene_name("../../../etc/passwd") == "passwd"
     assert fc.safe_scene_name("") == "scene.blend"
+
+
+def test_bake_objects_dedupe():
+    job, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A", "A", "B", "A"]}})
+    assert err is None and job["objects"] == ["A", "B"]
+
+
+def test_bake_s2a_rejects_string_bool():
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "selected_to_active": "false"}})
+    assert err and "布尔" in err
+
+
+def test_bake_rejects_nan_cage():
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "selected_to_active": True, "cage_extrusion": float("nan")}})
+    assert err and "有限数" in err
+
+
+def test_bake_visible_extra():
+    job, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "visible_extra": [" B ", "C"]}})
+    assert err is None and job["visible_extra"] == ["B", "C"]
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "visible_extra": ["", "C"]}})
+    assert err

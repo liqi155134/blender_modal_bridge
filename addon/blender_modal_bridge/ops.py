@@ -56,6 +56,9 @@ def _build_task(context) -> tuple[dict | None, str | None]:
         if sc.farm_bake_s2a:
             bake["cage_extrusion"] = sc.farm_bake_cage
             bake["max_ray_distance"] = sc.farm_bake_ray
+        extra = [n.strip() for n in (sc.farm_bake_visible_extra or "").split(",") if n.strip()]
+        if extra:
+            bake["visible_extra"] = extra
         return {"task_type": "bake", "bake": bake}, None
     render = _scene_props(context)
     if render["output"] == "video" and render["file_format"] != "PNG":
@@ -100,7 +103,9 @@ def _pack_and_save_copy() -> tuple[str, list[str]]:
     except Exception as e:
         print(f"[farm] pack_all 部分失败(继续,断链走警告): {e}")
     warnings = _precheck_missing()
-    tmp = Path(tempfile.gettempdir()) / f"farm_submit_{os.getpid()}.blend"
+    # 每次提交唯一文件名:同进程连续提交时,pid 固定名会被第二次保存覆盖/误删
+    import uuid as _uuid
+    tmp = Path(tempfile.gettempdir()) / f"farm_submit_{os.getpid()}_{_uuid.uuid4().hex[:8]}.blend"
     bpy.ops.wm.save_as_mainfile(filepath=str(tmp), copy=True, compress=True)
     for img in bpy.data.images:      # 还原:只 unpack 这次新 pack 的
         if img.packed_file and img.name not in packed_before:
@@ -178,6 +183,16 @@ class FARM_OT_submit(bpy.types.Operator):
                 if local_key in jobs._CANCEL_UPLOAD:
                     raise RuntimeError("上传已被用户取消")
                 d = c.run(task, up["blend_path"])
+                # /run 请求期间点的取消:远端 job 已创建,立即补发 cancel
+                if local_key in jobs._CANCEL_UPLOAD:
+                    note = ""
+                    try:
+                        r = c.cancel(d["id"])
+                        if r.get("error"):
+                            note = f"(远端取消失败,仍可能计费: {r['error']})"
+                    except Exception as ce:
+                        note = f"(远端取消失败,仍可能计费: {ce})"
+                    raise RuntimeError("已取消" + note)
             except Exception as e:
                 # ⚠ 必须在 except 块内先取值:Python 会在块退出时 del e,
                 # 闭包延迟到 timer 执行时引用 e 会 NameError(被 tick 兜底吞掉,
@@ -190,7 +205,9 @@ class FARM_OT_submit(bpy.types.Operator):
                     it2 = jobs.find(local_key)
                     if it2:
                         if _c:
-                            it2.status, it2.error = "cancelled", ""
+                            # 远端取消失败的警示必须留给用户看(仍可能计费)
+                            it2.status = "cancelled"
+                            it2.error = _err if "远端取消失败" in _err else ""
                         else:
                             it2.status, it2.error = "failed", _err
                         jobs.persist()

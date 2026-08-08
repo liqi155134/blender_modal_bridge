@@ -98,3 +98,10 @@ Submit。云端按 **对象 × pass 并行**(每单元一张 L40S),产物 `textu
 ## License
 
 MIT
+
+## 已知限制(farm-v2 待办,2026-08-08 codex review)
+
+- 滑动窗口按 FIFO 等待:单元耗时差异大时 GPU 会空转等最慢单元(耗时均匀的任务不受影响)
+- coordinator 固定 4h 超时,被平台硬杀后状态可能停留 running,已 spawn 子任务无 watchdog
+- 帧率按整数处理,23.976/29.97 NTSC 分数帧率长视频会漂移
+- Render 与 Bake 是两个独立 Modal function,各 max_containers=10,同时跑理论上限 20 GPU
