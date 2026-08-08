@@ -345,11 +345,14 @@ def _sliding_schedule(spawn_one, units: list, job_id: str, t0: float):
     def _fill():
         """填充窗口并逐个发布 call id。
 
-        :filling 是 cancel 端点的握手:取消方等它回 false 后再取快照,避免 coordinator
-        正处于 spawn→发布 id 的缝隙时先被杀掉,留下无法 cancel 的 GPU call。
+        :filling 是 cancel 端点的握手:取消方等它回 falsy/stale 后再取快照,避免
+        coordinator 正处于 spawn→发布 id 的缝隙时先被杀掉,留下无法 cancel 的 GPU call。
+        写时间戳而非 True:coordinator 在 fill 中被硬杀(OOM/平台强杀,finally 没跑)
+        会把 True 永远留在 Dict 里,cancel 端点将永久卡在"稍后重试"——超龄时间戳
+        可被端点判 stale 放行,死锁降级为最多等一个 staleness 窗口。
         """
         try:
-            job_state[f"{job_id}:filling"] = True
+            job_state[f"{job_id}:filling"] = time.time()
         except Exception:
             pass
         cancelled = False
@@ -857,9 +860,12 @@ def cancel_endpoint(payload: dict):
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         try:
-            if not job_state.get(f"{job_id}:filling"):
-                break
+            v = job_state.get(f"{job_id}:filling")
         except Exception:
+            break
+        # falsy = 空闲;时间戳超龄 = coordinator 在 fill 中被硬杀留下的残值(stale),
+        # 不能让它把 cancel 永久锁死 —— 放行。bool True(旧版残值)== 1,天然超龄。
+        if not v or (isinstance(v, (int, float)) and time.time() - float(v) > 30):
             break
         time.sleep(0.05)
     else:
