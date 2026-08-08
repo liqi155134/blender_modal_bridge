@@ -93,7 +93,8 @@ def _sweep_job_state():
                 if isinstance(s, dict) and s.get("status") in terminal]
 
     def _drop(jid):
-        for k in (jid, f"{jid}:call", f"{jid}:subcalls", f"{jid}:cancel"):  # 连带删独立 key,不留孤儿
+        for k in (jid, f"{jid}:call", f"{jid}:subcalls", f"{jid}:cancel",
+                  f"{jid}:filling"):  # 连带删独立 key,不留孤儿
             try:
                 del job_state[k]
             except Exception:
@@ -305,7 +306,19 @@ def _abort_if_cancelled(job_id: str):
     except Exception:
         return
     if flagged:
-        raise RuntimeError(f"job {job_id} 已被用户取消(worker 入口自检)")
+        raise _JobCancelled(f"job {job_id} 已被用户取消")
+
+
+class _JobCancelled(RuntimeError):
+    """内部取消信号:必须走 cancelled 终态,不能被当成普通 worker failed。"""
+
+
+def _cancel_requested(job_id: str) -> bool:
+    """Best-effort 读取取消旗;Dict 短暂不可用时不误杀正常任务。"""
+    try:
+        return bool(job_state.get(f"{job_id}:cancel"))
+    except Exception:
+        return False
 
 
 def _sliding_schedule(spawn_one, units: list, job_id: str, t0: float):
@@ -323,20 +336,45 @@ def _sliding_schedule(spawn_one, units: list, job_id: str, t0: float):
     done, warnings, device = 0, [], None
     results = []
 
-    def _fill():
-        if pending:
-            try:   # 用户已取消:不再 spawn 新单元(止损);Dict 读失败不挡任务
-                if job_state.get(f"{job_id}:cancel"):
-                    pending.clear()
-            except Exception:
-                pass
-        while pending and len(inflight) < window:
-            u = pending.popleft()
-            inflight[spawn_one(u)] = u
-        try:   # 滚动上报 in-flight 子 call,cancel 端点据此连带取消;写失败不碰任务
+    def _publish_subcalls():
+        try:
             job_state[f"{job_id}:subcalls"] = [c.object_id for c in inflight]
         except Exception:
             pass
+
+    def _fill():
+        """填充窗口并逐个发布 call id。
+
+        :filling 是 cancel 端点的握手:取消方等它回 false 后再取快照,避免 coordinator
+        正处于 spawn→发布 id 的缝隙时先被杀掉,留下无法 cancel 的 GPU call。
+        """
+        try:
+            job_state[f"{job_id}:filling"] = True
+        except Exception:
+            pass
+        cancelled = False
+        try:
+            while pending and len(inflight) < window:
+                if _cancel_requested(job_id):
+                    pending.clear()
+                    cancelled = True
+                    break
+                u = pending.popleft()
+                call = spawn_one(u)
+                inflight[call] = u
+                _publish_subcalls()  # 每次 spawn 立即发布,不把整个窗口留在竞态里
+            # flag 可能在最后一次 spawn 与循环退出之间到达,这里再收一次。
+            if _cancel_requested(job_id):
+                pending.clear()
+                cancelled = True
+        finally:
+            _publish_subcalls()
+            try:
+                job_state[f"{job_id}:filling"] = False
+            except Exception:
+                pass
+        if cancelled:
+            raise _JobCancelled(f"job {job_id} 已被用户取消(停止调度新单元)")
 
     _fill()
     while inflight:
@@ -369,9 +407,12 @@ def _fail_job(job_id: str, e: Exception):
         except Exception:
             pass
     cur = job_state.get(job_id) or {}
-    if cur.get("status") == "cancelled":
+    if cur.get("status") == "cancelled" or _cancel_requested(job_id):
         # cancel 端点已写终态;本异常只是取消传播(subcall 被 cancel → get() 抛
         # "Function call was cancelled…")——别用 failed + SDK 吓人文案覆盖用户的取消
+        if cur.get("status") != "cancelled":
+            job_state[job_id] = {**cur, "status": "cancelled",
+                                 "completed_at": time.time()}
         return
     job_state[job_id] = {**cur, "status": "failed",
                          "error": str(e), "trace": tb[-2000:],
@@ -379,11 +420,17 @@ def _fail_job(job_id: str, e: Exception):
 
 
 def _complete_job(job_id: str, outputs: list, warnings: list, device):
-    done_state = {**job_state.get(job_id, {}), "status": "completed", "outputs": outputs,
+    cur = job_state.get(job_id, {})
+    if cur.get("status") == "cancelled" or _cancel_requested(job_id):
+        job_state[job_id] = {**cur, "status": "cancelled",
+                             "completed_at": cur.get("completed_at") or time.time()}
+        return False
+    done_state = {**cur, "status": "completed", "outputs": outputs,
                   "render_device": device, "completed_at": time.time()}
     if warnings:
         done_state["warnings"] = warnings   # 缺贴图等断链:跑完了,但用户必须看见
     job_state[job_id] = done_state
+    return True
 
 
 @app.function(image=farm_image, volumes={"/vol": models_vol}, timeout=JOB_TIMEOUT)
@@ -397,6 +444,7 @@ def render_job(job: dict, job_id: str) -> dict:
     try:
         _results, warnings, device = _sliding_schedule(
             lambda f: render_frame.spawn(job, f, job_id), frames, job_id, t0)
+        _abort_if_cancelled(job_id)
         # ── 合成 / 打包(帧此刻全在 Volume;先 reload 看到其它容器 commit 的文件)──
         models_vol.reload()
         out_root = Path(f"/vol/_outputs/{job_id}")
@@ -421,6 +469,7 @@ def render_job(job: dict, job_id: str) -> dict:
                         "volume_path": f"_outputs/{job_id}/frames.zip",
                         "size_bytes": (out_root / "frames.zip").stat().st_size}]
         models_vol.commit()
+        _abort_if_cancelled(job_id)
     except Exception as e:
         _fail_job(job_id, e)
         raise
@@ -526,10 +575,14 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
     # 每 unit 只留 目标对 + visible_extra(显式声明的接触遮蔽参照,如相邻部件的
     # 高模)——多部件接触 AO 靠 visible_extra 传名,不再默认全场景可见。
     extra = list(job.get("visible_extra") or [])
-    extra_missing = [n for n in extra if n not in bpy.data.objects]  # 拼错不能静默
+    scene_names = {o.name for o in scene.objects}
+    extra_missing = [n for n in extra if n not in scene_names]  # 其他 Scene 同名也不能算命中
     keep = {obj.name} | ({hobj.name} if hobj else set()) | set(extra)
-    for other in bpy.data.objects:
-        if other.type == "MESH":
+    geometry_types = {"MESH", "CURVE", "SURFACE", "META", "FONT", "VOLUME",
+                      "CURVES", "POINTCLOUD", "GREASEPENCIL"}
+    for other in scene.objects:
+        # Curve/Volume/集合实例同样会进入 Cycles 射线;LIGHT 保留供 COMBINED pass 使用。
+        if other.type in geometry_types or (other.type == "EMPTY" and other.instance_collection):
             other.hide_render = other.name not in keep
     for target in filter(None, (obj, hobj)):
         target.hide_render = False
@@ -586,6 +639,7 @@ def bake_job(job: dict, job_id: str) -> dict:
     try:
         _results, warnings, device = _sliding_schedule(
             lambda u: bake_unit.spawn(job, u[0], u[1], job_id), units, job_id, t0)
+        _abort_if_cancelled(job_id)
         models_vol.reload()
         out_root = Path(f"/vol/_outputs/{job_id}")
         tex_dir = out_root / "textures"
@@ -596,6 +650,7 @@ def bake_job(job: dict, job_id: str) -> dict:
                     "volume_path": f"_outputs/{job_id}/textures.zip",
                     "size_bytes": (out_root / "textures.zip").stat().st_size}]
         models_vol.commit()
+        _abort_if_cancelled(job_id)
     except Exception as e:
         _fail_job(job_id, e)
         raise
@@ -782,28 +837,37 @@ def cancel_endpoint(payload: dict):
     if not job_id:
         return {"error": "Missing 'job_id'"}
     s = job_state.get(job_id) or {}
+    if not s:
+        return {"error": "job not found", "id": job_id}
+    if s.get("status") in ("completed", "failed", "cancelled"):
+        # 已完成的产物不能再伪装成 cancelled,否则客户端会失去 Download 入口。
+        return {"id": job_id, **s, "already_terminal": True}
     was_running = s.get("status") == "running"
-    # 先立取消旗,再杀 call::subcalls 只是 coordinator 最近一次写入的快照,
-    # spawn 了但没进快照的单元(写失败/取消传播窗口)靠 worker 入口自检这面旗自杀,
-    # coordinator 的 _fill 也凭它停止 spawn 新单元 —— 快照竞态从「漏杀」降级为「晚死几秒」
+    # 先立取消旗:_fill 会停止 spawn,worker 入口也会自检;随后用 :filling 握手取得
+    # 稳定 subcall 快照,确保已启动的 GPU call 都进入下面的显式 cancel。
     try:
         job_state[f"{job_id}:cancel"] = True
     except Exception as e:
         return {"id": job_id, "status": s.get("status") or "unknown",
                 "error": f"cancel 旗写入失败: {e}(未执行任何取消,重试 cancel)",
                 "was_running": was_running}
-    call_id = job_state.get(f"{job_id}:call")
-    if call_id:
+
+    # coordinator 在 _fill 中逐个 spawn 并发布 id。等 :filling 回 false 后再读快照、
+    # 再杀 coordinator,避免恰好卡在 spawn→发布之间而漏掉一个已启动的 GPU call。
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
         try:
-            modal.FunctionCall.from_id(call_id).cancel()
-        except Exception as e:
-            # 取消失败绝不能谎报成功:云端还在跑、还在计费,必须让调用方看见
-            print(f"[farm] cancel call {call_id} FAILED: {e}")
-            return {"id": job_id, "status": s.get("status") or "unknown",
-                    "error": f"cancel failed: {e}(取消旗已立,新单元不会再启动)",
-                    "was_running": was_running}
-    # coordinator 被杀后已 spawn 的帧不会自动停 —— 连带取消(滑动窗口保证 ≤ ~20 个)。
-    # 此刻 coordinator 已死,快照不会再涨;快照外的残留单元由入口自检旗兜底。
+            if not job_state.get(f"{job_id}:filling"):
+                break
+        except Exception:
+            break
+        time.sleep(0.05)
+    else:
+        return {"id": job_id, "status": s.get("status") or "unknown",
+                "error": "调度器仍在 spawn 子任务;取消旗已立,请稍后重试 cancel",
+                "was_running": was_running}
+
+    # 先停快照内子任务,再停 coordinator。flag 已阻止新 spawn,握手保证快照稳定。
     sub_failed = []
     for cid in (job_state.get(f"{job_id}:subcalls") or []):
         try:
@@ -811,11 +875,23 @@ def cancel_endpoint(payload: dict):
         except Exception as e:
             print(f"[farm] cancel subcall {cid} failed: {e}")
             sub_failed.append(cid)
-    if sub_failed:
-        # 子任务取消失败同样不能谎报:GPU 可能还在跑、还在计费
+    call_id = job_state.get(f"{job_id}:call")
+    call_error = None
+    if call_id:
+        try:
+            modal.FunctionCall.from_id(call_id).cancel()
+        except Exception as e:
+            print(f"[farm] cancel call {call_id} FAILED: {e}")
+            call_error = str(e)
+    if sub_failed or call_error:
+        details = []
+        if sub_failed:
+            details.append(f"{len(sub_failed)} 个子任务取消失败")
+        if call_error:
+            details.append(f"coordinator 取消失败: {call_error}")
         return {"id": job_id, "status": s.get("status") or "unknown",
-                "error": f"{len(sub_failed)} 个子任务取消失败(仍可能在计费),"
-                         f"稍后重试 cancel", "was_running": was_running}
+                "error": "; ".join(details) + "(取消旗已立,请稍后重试 cancel)",
+                "was_running": was_running}
     job_state[job_id] = {**s, "status": "cancelled", "completed_at": time.time()}
     return {"id": job_id, "status": "cancelled", "was_running": was_running}
 

@@ -122,6 +122,9 @@ def _poll_once(job_id: str):
             it.s_it, it.elapsed = p.get("s_it", it.s_it), p.get("elapsed", it.elapsed)
         if s.get("error"):
             it.error = str(s["error"])[:400]
+        elif it.status in ("completed", "cancelled"):
+            # 清掉取消重试/下载重试留下的瞬时警示,避免终态仍显示“正在计费”。
+            it.error = ""
         if s.get("warnings"):
             it.warnings = "; ".join(s["warnings"])[:800]
         if it.status == "completed" and not it.downloaded:

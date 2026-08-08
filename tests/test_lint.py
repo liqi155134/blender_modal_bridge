@@ -9,12 +9,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parent.parent
 
 
-@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff 未安装")
 def test_ruff_clean():
-    r = subprocess.run(["ruff", "check", str(ROOT)], capture_output=True, text=True)
+    ruff = shutil.which("ruff")
+    assert ruff is not None, "ruff 未安装;请先 pip install -r requirements-dev.txt"
+    r = subprocess.run([ruff, "check", str(ROOT)], capture_output=True, text=True)
     assert r.returncode == 0, f"ruff check 未通过:\n{r.stdout}{r.stderr}"

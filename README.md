@@ -76,6 +76,14 @@ docs/specs/                   # 设计文档
 docs/plans/                   # 实施计划
 ```
 
+本地检查先安装开发依赖,再跑测试和 lint:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest tests/ -q
+ruff check .
+```
+
 ## 烘焙贴图(Bake)
 
 面板顶部切到 **Bake** 模式:在视图里**选中要烘的网格**(可多选)→ 勾选 pass

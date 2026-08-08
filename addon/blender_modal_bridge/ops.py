@@ -190,23 +190,32 @@ class FARM_OT_submit(bpy.types.Operator):
                 if local_key in jobs._CANCEL_UPLOAD:
                     jobs._CANCEL_UPLOAD.discard(local_key)
                     note = ""
+                    remote_status = "cancelled"
                     try:
                         r = c.cancel(d["id"])
                         if r.get("error"):
                             note = str(r["error"])[:200]
+                        else:
+                            remote_status = str(r.get("status") or "cancelled")
                     except Exception as ce:
                         note = str(ce)[:200]
 
-                    def cancel_done(_id=d["id"], _n=note):
+                    def cancel_done(_id=d["id"], _n=note, _s=remote_status):
                         it2 = jobs.find(local_key)
                         if not it2:
                             return
                         it2.job_id = _id
+                        # 只要远端 job 已存在就必须补齐下载目录;取消失败后任务可能完成。
+                        it2.out_dir = str(Path(out_root) / _id)
                         if _n:
                             it2.status = "queued"   # 轮询刷新真实状态
                             it2.error = f"⚠ 远端取消失败,仍可能计费: {_n} —— 点 ✕ 重试"
-                        else:
+                        elif _s == "cancelled":
                             it2.status, it2.error = "cancelled", ""
+                        else:
+                            # 请求到达时任务已 completed/failed;回 queued 轮询完整终态与 outputs。
+                            it2.status = "queued"
+                            it2.error = f"取消请求到达时任务已 {_s},正在刷新最终状态"
                         jobs.persist()
                     jobs.push_result(cancel_done)
                     return   # finally 仍会清理 tmp / _XFER
@@ -277,7 +286,15 @@ class FARM_OT_cancel(bpy.types.Operator):
                 if r.get("error"):
                     it.error = f"取消失败(云端仍在计费!): {r['error']}"[:400]
                 else:
-                    it.status = "cancelled"
+                    remote_status = str(r.get("status") or "cancelled")
+                    if remote_status == "cancelled":
+                        it.status, it.error = "cancelled", ""
+                    else:
+                        # completed/failed 已是终态,不能在本地伪装成 cancelled;
+                        # 先恢复轮询以取得完整 outputs/error。
+                        it.status = "queued"
+                        it.error = f"取消请求到达时任务已 {remote_status},正在刷新最终状态"
+                        jobs.ensure_timer()
                 jobs.persist()
             jobs.push_result(apply)
         threading.Thread(target=work, daemon=True).start()
