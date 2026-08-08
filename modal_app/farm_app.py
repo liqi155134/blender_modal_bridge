@@ -16,6 +16,7 @@ farm_app.py — Blender Cycles serverless 渲染农场(Modal 独立 app)。
   4. job 协议 task_type 化(farm_common.normalize_job):MVP 只有 render,二期 bake
      加 worker 函数即可,upload/status/cancel/fetch/进度骨架不动。
 """
+import json
 import os
 import shutil
 import subprocess
@@ -92,7 +93,7 @@ def _sweep_job_state():
                 if isinstance(s, dict) and s.get("status") in terminal]
 
     def _drop(jid):
-        for k in (jid, f"{jid}:call", f"{jid}:subcalls"):  # 连带删独立 key,不留孤儿
+        for k in (jid, f"{jid}:call", f"{jid}:subcalls", f"{jid}:cancel"):  # 连带删独立 key,不留孤儿
             try:
                 del job_state[k]
             except Exception:
@@ -239,6 +240,7 @@ _SCENE = {"key": None, "warnings": [], "device": None}
 def render_frame(job: dict, frame: int, job_id: str) -> dict:
     """渲染单帧,写 Volume _outputs/<job_id>/frames/frame_%05d.<ext>,返回帧元数据。
     bpy 状态是进程级全局的 —— Modal function 默认一容器一 input 串行,天然安全。"""
+    _abort_if_cancelled(job_id)
     ext0 = "exr" if job["file_format"] == "OPEN_EXR" else "png"
     done = Path(f"/vol/_outputs/{job_id}/frames/frame_{frame:05d}.{ext0}")
     if done.is_file() and done.stat().st_size > 0:
@@ -294,6 +296,18 @@ def _await_call_key(job_id: str):
         time.sleep(0.1)
 
 
+def _abort_if_cancelled(job_id: str):
+    """worker 入口自检取消旗:cancel 端点的 :subcalls 快照可能漏掉刚 spawn 的单元
+    (Dict 写失败/取消传播窗口),这些单元在这里自杀而不是白烧 GPU。
+    Dict 读失败不挡任务(可用性优先;误跑一个单元的代价远小于误杀一个 job)。"""
+    try:
+        flagged = bool(job_state.get(f"{job_id}:cancel"))
+    except Exception:
+        return
+    if flagged:
+        raise RuntimeError(f"job {job_id} 已被用户取消(worker 入口自检)")
+
+
 def _sliding_schedule(spawn_one, units: list, job_id: str, t0: float):
     """滑动窗口 spawn 并行单元:in-flight ≤ 2×MAX_PARALLEL。为什么不 starmap/全量 spawn:
       - cancel 需要逐个取消子 call(coordinator 被 cancel 后已 spawn 的 input 不会自动停),
@@ -310,6 +324,12 @@ def _sliding_schedule(spawn_one, units: list, job_id: str, t0: float):
     results = []
 
     def _fill():
+        if pending:
+            try:   # 用户已取消:不再 spawn 新单元(止损);Dict 读失败不挡任务
+                if job_state.get(f"{job_id}:cancel"):
+                    pending.clear()
+            except Exception:
+                pass
         while pending and len(inflight) < window:
             u = pending.popleft()
             inflight[spawn_one(u)] = u
@@ -427,6 +447,7 @@ def _safe_unit_name(name: str) -> str:
 def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
     """烘焙单个 (对象, pass),写 Volume _outputs/<job_id>/textures/<obj>_<pass>.<ext>。
     场景缓存 key=job_id 同渲染;bake 与渲染共用 Cycles PT 内核(同吃 OPTIX/RT core)。"""
+    _abort_if_cancelled(job_id)
     ext = "exr" if job["file_format"] == "OPEN_EXR" else "png"
     fname = f"{_safe_unit_name(obj_name)}_{pass_type}.{ext}"
     final = Path(f"/vol/_outputs/{job_id}/textures/{fname}")
@@ -504,8 +525,9 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
     # 可见性隔离:场景里叠放的其他 LOD 档/源模会污染 AO 遮蔽射线与 s2a 采样。
     # 每 unit 只留 目标对 + visible_extra(显式声明的接触遮蔽参照,如相邻部件的
     # 高模)——多部件接触 AO 靠 visible_extra 传名,不再默认全场景可见。
-    keep = {obj.name} | ({hobj.name} if hobj else set()) \
-        | set(job.get("visible_extra") or [])
+    extra = list(job.get("visible_extra") or [])
+    extra_missing = [n for n in extra if n not in bpy.data.objects]  # 拼错不能静默
+    keep = {obj.name} | ({hobj.name} if hobj else set()) | set(extra)
     for other in bpy.data.objects:
         if other.type == "MESH":
             other.hide_render = other.name not in keep
@@ -543,10 +565,14 @@ def bake_unit(job: dict, obj_name: str, pass_type: str, job_id: str) -> dict:
     shutil.copyfile(tmp, final)
     tmp.unlink(missing_ok=True)
     models_vol.commit()
+    warns = list(_SCENE["warnings"] or [])
+    if extra_missing:
+        warns.append("visible_extra 对象不存在(拼写?已忽略): "
+                     + ", ".join(extra_missing[:8]))
     return {"unit": f"{obj_name}:{pass_type}",
             "path": f"_outputs/{job_id}/textures/{fname}",
             "size": final.stat().st_size, "secs": round(time.time() - t0, 1),
-            "warnings": _SCENE["warnings"], "device": _SCENE["device"]}
+            "warnings": warns, "device": _SCENE["device"]}
 
 
 @app.function(image=farm_image, volumes={"/vol": models_vol}, timeout=JOB_TIMEOUT)
@@ -757,6 +783,15 @@ def cancel_endpoint(payload: dict):
         return {"error": "Missing 'job_id'"}
     s = job_state.get(job_id) or {}
     was_running = s.get("status") == "running"
+    # 先立取消旗,再杀 call::subcalls 只是 coordinator 最近一次写入的快照,
+    # spawn 了但没进快照的单元(写失败/取消传播窗口)靠 worker 入口自检这面旗自杀,
+    # coordinator 的 _fill 也凭它停止 spawn 新单元 —— 快照竞态从「漏杀」降级为「晚死几秒」
+    try:
+        job_state[f"{job_id}:cancel"] = True
+    except Exception as e:
+        return {"id": job_id, "status": s.get("status") or "unknown",
+                "error": f"cancel 旗写入失败: {e}(未执行任何取消,重试 cancel)",
+                "was_running": was_running}
     call_id = job_state.get(f"{job_id}:call")
     if call_id:
         try:
@@ -765,8 +800,10 @@ def cancel_endpoint(payload: dict):
             # 取消失败绝不能谎报成功:云端还在跑、还在计费,必须让调用方看见
             print(f"[farm] cancel call {call_id} FAILED: {e}")
             return {"id": job_id, "status": s.get("status") or "unknown",
-                    "error": f"cancel failed: {e}", "was_running": was_running}
-    # coordinator 被杀后已 spawn 的帧不会自动停 —— 连带取消(滑动窗口保证 ≤ ~20 个)
+                    "error": f"cancel failed: {e}(取消旗已立,新单元不会再启动)",
+                    "was_running": was_running}
+    # coordinator 被杀后已 spawn 的帧不会自动停 —— 连带取消(滑动窗口保证 ≤ ~20 个)。
+    # 此刻 coordinator 已死,快照不会再涨;快照外的残留单元由入口自检旗兜底。
     sub_failed = []
     for cid in (job_state.get(f"{job_id}:subcalls") or []):
         try:

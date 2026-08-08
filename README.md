@@ -86,7 +86,12 @@ Submit。云端按 **对象 × pass 并行**(每单元一张 L40S),产物 `textu
 - 前提:对象 **UV 已展好**(无 UV 明确报错);目标贴图由农场创建,Normal/Roughness/AO
   自动存为 Non-Color
 - **高模→低模**:勾 "High → Low",按 `<name>_low` / `<name>_high` 命名约定自动配对
-  (选中低模提交;cage extrusion 可调)
+  (选中低模提交;cage extrusion / max ray distance 可调)
+- **可见性隔离与 Visible Extra**:每个烘焙单元只保留目标对象(s2a 时加配对高模)可见,
+  场景里叠放的其他 LOD 档 / 源模不会污染 AO 遮蔽与 s2a 采样。代价是**相邻部件的接触
+  遮蔽默认也会消失** —— 需要参与遮蔽的对象(如枪身烘 AO 时的握把 / 弹匣)把对象名填进
+  **Visible Extra**(逗号分隔),这些对象在所有单元中保持可见。名字拼错会出现在任务
+  警告里(不会静默忽略)
 - 上限:单 job ≤ 256 单元(对象 × pass);多材质槽对象每个槽都会自动挂目标节点
 
 ## Roadmap
@@ -105,3 +110,7 @@ MIT
 - coordinator 固定 4h 超时,被平台硬杀后状态可能停留 running,已 spawn 子任务无 watchdog
 - 帧率按整数处理,23.976/29.97 NTSC 分数帧率长视频会漂移
 - Render 与 Bake 是两个独立 Modal function,各 max_containers=10,同时跑理论上限 20 GPU
+- Bake 可见性隔离只有「目标对 + Visible Extra 显式点名」一种模式;更顺手的档位
+  (Target only / All submitted objects / Whole scene)待做
+- `/run` 响应在网络中丢失时,远端 job 已创建但客户端拿不到 id,无法取消(需要
+  jobs 列表端点才能找回孤儿任务)

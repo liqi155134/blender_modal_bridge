@@ -10,9 +10,9 @@ bl_info = {
     "category": "Render",
 }
 
-import bpy
+import bpy  # noqa: E402 — bl_info 必须先于 import(Blender addon 惯例)
 
-from . import jobs, ops, ui
+from . import jobs, ops, ui  # noqa: E402
 
 
 class FarmPreferences(bpy.types.AddonPreferences):

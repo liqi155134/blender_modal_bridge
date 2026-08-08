@@ -183,16 +183,33 @@ class FARM_OT_submit(bpy.types.Operator):
                 if local_key in jobs._CANCEL_UPLOAD:
                     raise RuntimeError("上传已被用户取消")
                 d = c.run(task, up["blend_path"])
-                # /run 请求期间点的取消:远端 job 已创建,立即补发 cancel
+                # /run 请求期间点的取消:远端 job 已创建,立即补发 cancel。
+                # ⚠ 取消失败绝不能把 item 写成 cancelled:那会丢远端 id、丢 Cancel
+                # 按钮,任务失联但云端还在计费。失败 → 保住远端 id,回 queued 让
+                # 轮询接管,error 警示留在卡片上,用户可点 ✕ 重试
                 if local_key in jobs._CANCEL_UPLOAD:
+                    jobs._CANCEL_UPLOAD.discard(local_key)
                     note = ""
                     try:
                         r = c.cancel(d["id"])
                         if r.get("error"):
-                            note = f"(远端取消失败,仍可能计费: {r['error']})"
+                            note = str(r["error"])[:200]
                     except Exception as ce:
-                        note = f"(远端取消失败,仍可能计费: {ce})"
-                    raise RuntimeError("已取消" + note)
+                        note = str(ce)[:200]
+
+                    def cancel_done(_id=d["id"], _n=note):
+                        it2 = jobs.find(local_key)
+                        if not it2:
+                            return
+                        it2.job_id = _id
+                        if _n:
+                            it2.status = "queued"   # 轮询刷新真实状态
+                            it2.error = f"⚠ 远端取消失败,仍可能计费: {_n} —— 点 ✕ 重试"
+                        else:
+                            it2.status, it2.error = "cancelled", ""
+                        jobs.persist()
+                    jobs.push_result(cancel_done)
+                    return   # finally 仍会清理 tmp / _XFER
             except Exception as e:
                 # ⚠ 必须在 except 块内先取值:Python 会在块退出时 del e,
                 # 闭包延迟到 timer 执行时引用 e 会 NameError(被 tick 兜底吞掉,
@@ -205,9 +222,9 @@ class FARM_OT_submit(bpy.types.Operator):
                     it2 = jobs.find(local_key)
                     if it2:
                         if _c:
-                            # 远端取消失败的警示必须留给用户看(仍可能计费)
-                            it2.status = "cancelled"
-                            it2.error = _err if "远端取消失败" in _err else ""
+                            # 走到这里的取消都发生在上传阶段(run 后的取消在
+                            # try 内 inline 处理),远端从未建 job,干净取消
+                            it2.status, it2.error = "cancelled", ""
                         else:
                             it2.status, it2.error = "failed", _err
                         jobs.persist()

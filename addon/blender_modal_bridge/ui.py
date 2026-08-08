@@ -177,9 +177,13 @@ class FARM_PT_panel(bpy.types.Panel):
                 box.label(text=err[68:136])
         elif it.status == "cancelled":
             box.label(text="已取消", icon="X")
+        if it.error and it.status != "failed":
+            # 非 failed 状态的 error 是风险警示(如「远端取消失败,仍可能计费」),
+            # 必须显示 —— 只在 failed 分支显示 error 会把它吞掉
+            box.label(text=it.error[:68], icon="ERROR")
         if it.warnings:
             n = it.warnings.count(";") + 1
-            box.label(text=f"⚠ 外部资产断链 {n} 处: {it.warnings[:56]}…",
+            box.label(text=f"⚠ {n} 条警告: {it.warnings[:56]}…",
                       icon="LIBRARY_DATA_BROKEN")
 
 
