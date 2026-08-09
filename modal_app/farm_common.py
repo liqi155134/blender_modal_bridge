@@ -308,3 +308,18 @@ def bake_output_stem(name: str) -> str:
         safe = safe[:-1]
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
     return f"{safe}--{digest}"
+
+
+# .blend 容器魔数。⚠ 只认 b"BLENDER" 是错的:Blender 3.0+ 的 compress=True 存的是
+# Zstandard 容器,2.9 及更早是 gzip —— addon 提交时一律压缩,只认未压缩头会把
+# 所有真实场景拒之门外(2026-08-09 实锤:8K 烘焙任务在末块合并时 HTTP 400)。
+BLEND_MAGICS = (
+    b"BLENDER",            # 未压缩
+    b"\x28\xb5\x2f\xfd",   # Zstandard(Blender 3.0+ compress=True)
+    b"\x1f\x8b",           # gzip(Blender ≤ 2.9 的旧压缩格式)
+)
+
+
+def looks_like_blend(head: bytes) -> bool:
+    """文件头 → 是否是 .blend(含压缩容器)。传入至少前 7 字节。"""
+    return any(bytes(head).startswith(m) for m in BLEND_MAGICS)

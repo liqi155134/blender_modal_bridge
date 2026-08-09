@@ -949,10 +949,12 @@ def _finalize_scene_file(tmp: Path, name: str, size: int) -> dict:
     from fastapi.responses import JSONResponse
     try:
         with open(tmp, "rb") as f:
-            if f.read(7) != b"BLENDER":
-                tmp.unlink(missing_ok=True)
-                return JSONResponse({"error": "上传内容不是有效 Blender .blend 文件"},
-                                    status_code=400)
+            head = f.read(7)
+        if not farm_common.looks_like_blend(head):
+            tmp.unlink(missing_ok=True)
+            return JSONResponse(
+                {"error": f"上传内容不是有效 Blender .blend 文件(头 {head[:4].hex()})"},
+                status_code=400)
     except OSError as e:
         tmp.unlink(missing_ok=True)
         return JSONResponse({"error": f"上传临时文件读取失败: {e}"}, status_code=500)

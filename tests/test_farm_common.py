@@ -250,3 +250,16 @@ def test_bake_isolation_modes():
     _, err = fc.normalize_job({"task_type": "bake", "bake": {
         "objects": ["A"], "isolation": "random"}})
     assert err
+
+
+def test_looks_like_blend_accepts_compressed_containers():
+    """回归:Blender 3.0+ compress=True 存 Zstandard,只认 b"BLENDER" 会拒掉所有真实场景。"""
+    assert fc.looks_like_blend(b"BLENDER-v502")          # 未压缩
+    assert fc.looks_like_blend(b"\x28\xb5\x2f\xfd\x60\x41\x93")  # zstd
+    assert fc.looks_like_blend(b"\x1f\x8b\x08\x00\x00\x00\x00")  # gzip
+
+
+def test_looks_like_blend_rejects_other_content():
+    assert not fc.looks_like_blend(b"PK\x03\x04zip")
+    assert not fc.looks_like_blend(b"\x89PNG\r\n\x1a")
+    assert not fc.looks_like_blend(b"")
