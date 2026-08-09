@@ -3,8 +3,9 @@ farm_common.py — 提交协议的纯函数层(校验 / 帧列表 / ffmpeg 命�
 
 零第三方依赖(纯 stdlib):云端 farm_app(容器内以顶层名 import)、Blender addon、
 单测三方共用。协议改动先改这里的校验再动别处。
-task_type 从第一版就存在:MVP 只实现 render,二期 bake 时这里加分支,骨架不动。
+task_type 支持 render / bake;两者共用上传、调度、取消、状态与下载骨架。
 """
+import hashlib
 import math
 import os
 import re
@@ -30,10 +31,25 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
     if blend_path is not None:
         norm = os.path.normpath(str(blend_path)).replace("\\", "/")
         if (not isinstance(blend_path, str) or not blend_path.startswith("scenes/")
-                or ".." in blend_path or blend_path != norm):
+                or ".." in blend_path or blend_path != norm or len(blend_path) > 255):
             return None, "blend_path 必须是 Volume 上 scenes/ 下的相对路径(由 /upload 返回)"
+    scene_name = payload.get("scene_name")
+    if scene_name is not None:
+        if not isinstance(scene_name, str) or not scene_name.strip():
+            return None, "scene_name 必须是非空字符串(.blend 里的 Scene 名)"
+        scene_name = scene_name.strip()
+        if len(scene_name) > 255:
+            return None, "scene_name 过长(最多 255 字符)"
+    view_layer_name = payload.get("view_layer_name")
+    if view_layer_name is not None:
+        if not isinstance(view_layer_name, str) or not view_layer_name.strip():
+            return None, "view_layer_name 必须是非空字符串"
+        view_layer_name = view_layer_name.strip()
+        if len(view_layer_name) > 255:
+            return None, "view_layer_name 过长(最多 255 字符)"
     if task_type == "bake":
-        return _normalize_bake(payload.get("bake") or {}, blend_path)
+        return _normalize_bake(
+            payload.get("bake") or {}, blend_path, scene_name, view_layer_name)
     r = payload.get("render") or {}
     if not isinstance(r, dict):
         return None, "render 必须是对象"
@@ -71,17 +87,30 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
         return None, "file_format 只能是 PNG 或 OPEN_EXR"
     if output == "video" and fmt != "PNG":
         return None, "video 输出只支持 PNG 帧;EXR 请用 output=frames"
+    # ffmpeg glob 会把缺帧压成连续画面,不会保留原时间轴。拒绝稀疏帧生成
+    # 一个时长/动作速度都错误、却看起来能播放的 mp4。
+    if output == "video" and (step != 1 or n != end - start + 1):
+        return None, "video 只支持连续帧(step=1);补渲散帧/跳帧请用 output=frames"
     try:
-        fps = int(r.get("fps", 24))
+        fps_num = int(r.get("fps_num", r.get("fps", 24)))
+        fps_den = int(r.get("fps_den", 1))
     except (TypeError, ValueError):
-        return None, "fps 必须是整数"
-    if not 1 <= fps <= 240:
-        return None, "fps 范围 1..240"
+        return None, "fps_num / fps_den 必须是整数"
+    # 用整数交叉比较,不把外部传入的超大 int 转 float(可 OverflowError)。
+    if fps_num < 1 or fps_den < 1 or fps_num < fps_den or fps_num > 240 * fps_den:
+        return None, "帧率范围 1..240 fps(fps_num/fps_den 须为正整数)"
     job = {"task_type": task_type, "blend_path": blend_path,
            "frame_start": start, "frame_end": end, "frame_step": step,
-           "output": output, "file_format": fmt, "fps": fps}
+           "output": output, "file_format": fmt,
+           "fps_num": fps_num, "fps_den": fps_den}
+    if scene_name is not None:
+        job["scene_name"] = scene_name
+    if view_layer_name is not None:
+        job["view_layer_name"] = view_layer_name
     if frames_spec is not None:
         job["frames_spec"] = str(frames_spec).strip()
+    limits = {"resolution_x": 32768, "resolution_y": 32768,
+              "resolution_percentage": 100, "samples": 1_000_000}
     for k in ("resolution_x", "resolution_y", "resolution_percentage", "samples"):
         v = r.get(k)
         if v is None:
@@ -92,6 +121,8 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
             return None, f"{k} 必须是整数"
         if v < 1:
             return None, f"{k} 必须 ≥ 1"
+        if v > limits[k]:
+            return None, f"{k} 必须 ≤ {limits[k]}"
         job[k] = v
     cam = r.get("camera")
     if cam is not None:
@@ -101,7 +132,8 @@ def normalize_job(payload: dict) -> tuple[dict | None, str | None]:
     return job, None
 
 
-def _normalize_bake(b: dict, blend_path) -> tuple[dict | None, str | None]:
+def _normalize_bake(b: dict, blend_path, scene_name=None,
+                    view_layer_name=None) -> tuple[dict | None, str | None]:
     """bake 参数校验 → 扁平 job。对象 × pass 是并行单元。"""
     if not isinstance(b, dict):
         return None, "bake 必须是对象"
@@ -112,7 +144,9 @@ def _normalize_bake(b: dict, blend_path) -> tuple[dict | None, str | None]:
     if len(objects) > 128:
         return None, "objects 最多 128 个"
     objects = list(dict.fromkeys(o.strip() for o in objects))   # 去重保序:重复对象=并发写同一输出
-    raw_passes = b.get("passes") or ["NORMAL", "AO"]
+    raw_passes = b.get("passes", ["NORMAL", "AO"])
+    if not isinstance(raw_passes, list) or not raw_passes:
+        return None, "passes 必须是非空列表"
     passes = []
     for p in raw_passes:
         p = str(p).upper()
@@ -133,11 +167,19 @@ def _normalize_bake(b: dict, blend_path) -> tuple[dict | None, str | None]:
     if (not isinstance(extra, list) or len(extra) > 64
             or not all(isinstance(o, str) and o.strip() for o in extra)):
         return None, "visible_extra 须是对象名列表(≤64,非空字符串)"
+    isolation = str(b.get("isolation") or "TARGET").upper()
+    if isolation not in ("TARGET", "SUBMITTED", "SCENE"):
+        return None, "isolation 只能是 TARGET / SUBMITTED / SCENE"
     job = {"task_type": "bake", "blend_path": blend_path,
            "objects": objects, "passes": passes,
            "selected_to_active": s2a,
            "visible_extra": [o.strip() for o in extra],
+           "isolation": isolation,
            "file_format": fmt}
+    if scene_name is not None:
+        job["scene_name"] = scene_name
+    if view_layer_name is not None:
+        job["view_layer_name"] = view_layer_name
     try:
         res = int(b.get("resolution", 2048))
         margin = int(b.get("margin", 16))
@@ -198,7 +240,14 @@ def expand_frame_spec(spec: str) -> list[int]:
             raise ValueError(f"step 必须 ≥ 1: {part.strip()!r}")
         if end < start:
             raise ValueError(f"区间尾 < 头: {part.strip()!r}")
-        frames.update(range(start, end + 1, step))
+        if start < 0 or end > MAX_FRAME_NO:
+            raise ValueError(f"帧号范围 0..{MAX_FRAME_NO}: {part.strip()!r}")
+        # 不可先 frames.update(超大 range) 再检查长度:恶意/误输的范围会在
+        # normalize_job 有机会返回错误前吃光 endpoint 或 Blender 的内存。
+        for frame in range(start, end + 1, step):
+            frames.add(frame)
+            if len(frames) > MAX_FRAMES:
+                raise ValueError(f"单 job 最多 {MAX_FRAMES} 帧")
     return sorted(frames)
 
 
@@ -218,10 +267,12 @@ def parse_frame_spec(spec: str) -> tuple[int, int, int]:
     return start, end, step
 
 
-def ffmpeg_cmd(frames_dir: str, out_path: str, fps: int) -> list[str]:
+def ffmpeg_cmd(frames_dir: str, out_path: str, fps_num: int,
+               fps_den: int = 1) -> list[str]:
     """PNG 帧序列 → H.264 mp4。glob 按字典序 = 帧序(帧名固定 %05d 零填充)。
     pad 滤镜兜底奇数分辨率(yuv420p 要求偶数,场景分辨率是艺术家定的,不该因此失败)。"""
-    return ["ffmpeg", "-y", "-framerate", str(fps), "-pattern_type", "glob",
+    rate = str(fps_num) if fps_den == 1 else f"{fps_num}/{fps_den}"
+    return ["ffmpeg", "-y", "-framerate", rate, "-pattern_type", "glob",
             "-i", f"{frames_dir}/*.png",
             # crf 20 + 关键帧间隔 18:对齐 Flamenco 官方出片参数(x264 默认 crf23 偏低)
             "-c:v", "libx264", "-crf", "20", "-g", "18", "-pix_fmt", "yuv420p",
@@ -233,4 +284,27 @@ def safe_scene_name(name: str) -> str:
     """上传文件名清洗:取 basename、危险字符换 _,空则兜底。upload 端点用。"""
     base = os.path.basename(str(name).replace("\\", "/")).strip()
     base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
-    return base or "scene.blend"
+    if not base:
+        return "scene.blend"
+    # Volume 内容名还会加 64-byte SHA-256 前缀;封顶后保持常见 255-byte
+    # 文件名限制,且统一扩展名避免 .BLEND 被无意义拒绝。
+    if base.lower().endswith(".blend"):
+        base = base[:-6][:154] + ".blend"
+    else:
+        base = base[:160]
+    return base
+
+
+def bake_output_stem(name: str) -> str:
+    """对象名 → 可识别且实际不碰撞的贴图文件名片段。
+
+    仅替换危险字符会让 ``A/B`` 与 ``A\\B`` 都变成 ``A_B``;全部带原名
+    SHA-256 短后缀,同时规避 macOS/Windows 大小写不敏感文件系统的覆盖。
+    """
+    raw = str(name)
+    safe = re.sub(r"[/\\\x00-\x1f]", "_", raw).strip() or "obj"
+    # Blender ID 通常不长,仍封顶避免 UTF-8 文件名超过常见 255-byte 上限。
+    while len(safe.encode("utf-8")) > 180:
+        safe = safe[:-1]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{safe}--{digest}"

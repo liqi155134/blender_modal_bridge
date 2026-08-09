@@ -12,7 +12,7 @@ Blender 5.2 (addon, N 面板)                Modal 云端 (app: blender-bridge)
 ┌─────────────────────────┐    HTTPS     ┌──────────────────────────────────┐
 │ 提交 / 进度 / 取回         │ ──upload──→ │ upload 端点 → Volume              │
 │ pack 副本 + 断链预检       │ ──run─────→ │ coordinator(CPU) 滑动窗口分帧      │
-│ 后台线程 + timer 轮询      │ ←─status──  │   └→ render_frame(L40S,OptiX)×N  │
+│ 后台线程 + timer 轮询      │ ←─status──  │   └→ gpu_unit(L40S,OptiX)×N      │
 │ 结果落 //render_farm/     │ ←─fetch───  │ 产物: render.mp4 | frames.zip     │
 └─────────────────────────┘              └──────────────────────────────────┘
 ```
@@ -20,15 +20,22 @@ Blender 5.2 (addon, N 面板)                Modal 云端 (app: blender-bridge)
 ## 特性
 
 - **逐帧并行**:一段动画拆成单帧任务扇出到多张 GPU(默认上限 10 并行,费用护栏),
-  实测 720p/64spp 稳态 ~1.5-2.5s/帧(含场景加载摊销)
+  Render/Bake 共用该全局上限;实测 720p/64spp 稳态 ~1.5-2.5s/帧(含场景加载摊销)
 - **OptiX 加速**:Cycles `compute_device_type=OPTIX` 吃满 L40S 的 RT core,
   枚举失败自动逐级回退 CUDA → CPU;OptiX denoiser 在容器内不可用,自动降级 OIDN
-- **场景是真源**:分辨率 / 采样 / 相机 / fps / denoise 全部尊重 .blend 里的设置,农场不覆盖
-- **不动工作文件**:提交时 pack 贴图到临时副本上传,你的 .blend 和会话状态保持原样;
-  外部资产断链(缺贴图 / Link 库)提交前后双重警告
-- **serverless 计费**:任务结束容器即回收(cancel 实测零残留),不跑不花钱
-- **协议可扩展**:job 带 `task_type`,渲染之外的任务类型(如烘焙贴图)加 worker 即可,
-  上传 / 状态 / 取消 / 取回骨架不动
+- **场景是真源**:显式携带当前 Scene + View Layer;分辨率 / 采样 / 相机 /
+  分数帧率(23.976/29.97) / denoise 尊重 .blend 设置,多 Scene 不猜测上下文
+- **不动工作文件**:当前 Blender 只做 save-copy,独立后台 Blender 进程对副本
+  pack 后上传;当前会话不执行 pack/unpack,Image/Font/Sound 的 packed 状态不变;
+  外部资产断链提交前后双重警告
+- **serverless 计费**:提交前弹窗列出 Scene/帧数或 Bake 单元/输出格式并明确确认;
+  取消用两阶段 launch gate 保证未登记的 GPU worker 不会偷跑
+- **可恢复运行**:`/run` 带幂等 request ID,响应丢失可安全重试而不重复计费;
+  连续重试仍失败时任务卡保留 request/场景/参数,点恢复按钮会先找回原任务、确认
+  不存在才用同一 ID 重试;coordinator token 绑定防止迟到调用被错误放行;
+  平台硬超时后 status watchdog 会清理僵尸 running 状态;未下载产物保留 30 天,
+  成功落盘后标记 fetched 并清理远端文件;上传场景用完整 SHA-256 去重,30 天未复用清理
+- **统一任务协议**:Render/Bake 共用上传、状态、取消、取回和全局 GPU 并发护栏
 
 ## 部署(一次性)
 
@@ -53,15 +60,20 @@ python3 smoke_test.py --frames 1-8     # 内置 demo 场景全链路冒烟(不�
 
 ## 使用
 
-面板里选帧范围(Scene Range / Current Frame / Custom)、输出(Video mp4 / Frames zip、
+面板会显示当前 **Scene / View Layer**。选帧范围(Scene Range / Current Frame / Custom)、
+输出(Video mp4 / Frames zip、
 PNG / OpenEXR)→ **Submit to Farm**。任务列表实时显示 `已完成帧数/总帧数` 与秒/帧;
 完成后自动下载到 `//render_farm/<job_id>/`(preferences 可改目录 / 关自动下载)。
+若 `/run` 响应始终丢失,失败卡片右侧会出现恢复按钮;先恢复拿到远端 ID,再按需取消。
 
 注意:
 
-- **只支持 Cycles**——EEVEE 无头渲染需要 GPU context,不支持(提交后首帧明确报错)
-- **Link 的库文件不会打包上传**,面板会红字警告;需要的话先 Make Local
-- 单 job ≤ 2000 帧;上传走 HTTP 单 POST 流式,百 MB 级场景可用(GB 级建议先精简)
+- **只支持 Cycles**——EEVEE 无头渲染需要 GPU context,面板会阻止提交
+- **Link 的库文件不会打包上传**,确认弹窗和任务详情会警告;需要的话先 Make Local
+- 单 job ≤ 2000 帧;大于 16MB 自动分块、块级重试/取消,GB 级仍建议先精简
+- Video 只接受连续帧(step=1);稀疏补帧/跳帧必须选 Frames,避免 mp4 时间轴被压短
+- mp4 是**无声画面预览**;如需 VSE/音轨,下载 Frames 后在本地剪辑/封装
+- 默认 `//render_farm/` 是相对 .blend 的目录,所以未保存文件会先要求保存
 
 ## 仓库结构
 
@@ -89,7 +101,8 @@ ruff check .
 面板顶部切到 **Bake** 模式:在视图里**选中要烘的网格**(可多选)→ 勾选 pass
 (Normal / AO / Diffuse(albedo)/ Roughness / Emit / Combined)→ 分辨率 / margin →
 Submit。云端按 **对象 × pass 并行**(每单元一张 L40S),产物 `textures.zip`
-(`<对象>_<pass>.png|exr`)自动下载。
+(`<对象>--<稳定短hash>_<pass>.png|exr`)自动下载;hash 防止对象名在路径清洗
+或大小写不敏感文件系统上互相覆盖。
 
 - 前提:对象 **UV 已展好**(无 UV 明确报错);目标贴图由农场创建,Normal/Roughness/AO
   自动存为 Non-Color
@@ -100,6 +113,8 @@ Submit。云端按 **对象 × pass 并行**(每单元一张 L40S),产物 `textu
   遮蔽默认也会消失** —— 需要参与遮蔽的对象(如枪身烘 AO 时的握把 / 弹匣)把对象名填进
   **Visible Extra**(逗号分隔),这些对象在所有单元中保持可见。名字拼错会出现在任务
   警告里(不会静默忽略)
+- **Isolation** 可切 Target Only / All Submitted / Whole Scene,分别适合单件干净烘焙、
+  多部件接触遮蔽与完整场景遮挡。
 - 上限:单 job ≤ 256 单元(对象 × pass);多材质槽对象每个槽都会自动挂目标节点
 
 ## Roadmap
@@ -112,13 +127,8 @@ Submit。云端按 **对象 × pass 并行**(每单元一张 L40S),产物 `textu
 
 MIT
 
-## 已知限制(farm-v2 待办,2026-08-08 codex review)
+## 已知限制
 
-- 滑动窗口按 FIFO 等待:单元耗时差异大时 GPU 会空转等最慢单元(耗时均匀的任务不受影响)
-- coordinator 固定 4h 超时,被平台硬杀后状态可能停留 running,已 spawn 子任务无 watchdog
-- 帧率按整数处理,23.976/29.97 NTSC 分数帧率长视频会漂移
-- Render 与 Bake 是两个独立 Modal function,各 max_containers=10,同时跑理论上限 20 GPU
-- Bake 可见性隔离只有「目标对 + Visible Extra 显式点名」一种模式;更顺手的档位
-  (Target only / All submitted objects / Whole scene)待做
-- `/run` 响应在网络中丢失时,远端 job 已创建但客户端拿不到 id,无法取消(需要
-  jobs 列表端点才能找回孤儿任务)
+- Bake 目标为单张方形贴图,尚不生成 UDIM tile;Link Library/外部 simulation cache
+  不会被 Blender `pack_all` 嵌入,提交前会警告;未烘焙的 Cloth/Fluid/Soft Body/
+  Dynamic Paint/Particles/Rigid Body 也会警告分布式逐帧状态风险(这类资产待 BAT/CAS 方案)

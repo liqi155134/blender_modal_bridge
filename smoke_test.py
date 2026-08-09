@@ -8,6 +8,7 @@ import argparse
 import json
 import sys
 import time
+import uuid
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -27,8 +28,10 @@ def post(label, body):
 
 
 def get(label, **params):
-    qs = urllib.parse.urlencode({**params, "key": KEY})
-    with urllib.request.urlopen(f"{BASE}-{label}.modal.run?{qs}", timeout=30) as r:
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        f"{BASE}-{label}.modal.run?{qs}", headers={"X-Farm-Key": KEY})
+    with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
 
 
@@ -47,8 +50,9 @@ def main():
                    "bake": {"objects": ["Cube"], "passes": ["NORMAL", "AO"],
                             "resolution": 512, "file_format": args.format}}
     else:
-        payload = {"render": {"frames": args.frames,   # 复合 spec 直接透传("1,3-5,8:2")
+        payload = {"render": {"frames": args.frames,   # 稀疏复合 spec 请配 --output frames
                               "output": args.output, "file_format": args.format}}
+    payload["request_id"] = uuid.uuid4().hex
     d = post("run", payload)
     if "id" not in d:
         sys.exit(f"提交失败: {d}")
@@ -59,8 +63,9 @@ def main():
         time.sleep(3)
         s = get("status", job_id=job_id)
         p = s.get("progress") or {}
-        print(f"  [{s.get('status')}] {p.get('step', 0)}/{p.get('total', '?')} 帧"
-              f" · {p.get('s_it', '?')}s/帧 · 已 {int(time.time() - t0)}s", flush=True)
+        unit = "单元" if args.task == "bake" else "帧"
+        print(f"  [{s.get('status')}] {p.get('step', 0)}/{p.get('total', '?')} {unit}"
+              f" · {p.get('s_it', '?')}s/{unit} · 已 {int(time.time() - t0)}s", flush=True)
         if args.cancel_after and time.time() - t0 > args.cancel_after:
             print("cancel:", post("cancel", {"job_id": job_id}))
             return
@@ -75,9 +80,11 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     for o in s.get("outputs") or []:
         qs = urllib.parse.urlencode({"job_id": job_id, "path": o["volume_path"],
-                                     "key": KEY, "delete": 1})
+                                     "delete": 1})
         dest = out_dir / o["filename"]
-        with urllib.request.urlopen(f"{BASE}-fetch.modal.run?{qs}", timeout=600) as r, \
+        req = urllib.request.Request(
+            f"{BASE}-fetch.modal.run?{qs}", headers={"X-Farm-Key": KEY})
+        with urllib.request.urlopen(req, timeout=600) as r, \
                 open(dest, "wb") as f:
             while chunk := r.read(1 << 20):
                 f.write(chunk)

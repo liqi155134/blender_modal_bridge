@@ -18,7 +18,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CFG = HERE / "farm_config.json"
 APP_NAME = "blender-bridge"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 def load_cfg() -> dict:
@@ -35,6 +35,12 @@ def main():
     ap.add_argument("--frame-timeout", type=int, default=1800)
     ap.add_argument("--job-timeout", type=int, default=14400)
     args = ap.parse_args()
+    if not 1 <= args.max_parallel <= 100:
+        ap.error("--max-parallel 必须在 1..100(费用护栏)")
+    if args.frame_timeout < 60:
+        ap.error("--frame-timeout 必须 ≥ 60 秒")
+    if args.job_timeout <= args.frame_timeout:
+        ap.error("--job-timeout 必须大于 --frame-timeout")
 
     cfg = load_cfg()
     farm_key = cfg.get("farm_key") or ("fk-" + pysecrets.token_urlsafe(24))  # 复用旧 key,重部署不换锁

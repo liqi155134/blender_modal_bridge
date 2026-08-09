@@ -3,7 +3,7 @@ N 面板(3D 视图 → Farm 页签)提交当前文件,进度可视,产物自动�
 bl_info = {
     "name": "Blender Modal Bridge (Render Farm)",
     "author": "liqi",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Farm",
     "description": "Submit Cycles renders to Modal serverless GPUs (L40S/OptiX)",

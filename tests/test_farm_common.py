@@ -14,7 +14,8 @@ def test_normalize_defaults():
     assert err is None
     assert job["task_type"] == "render" and job["blend_path"] is None
     assert job["frame_start"] == 1 == job["frame_end"] and job["frame_step"] == 1
-    assert job["output"] == "video" and job["file_format"] == "PNG" and job["fps"] == 24
+    assert job["output"] == "video" and job["file_format"] == "PNG"
+    assert job["fps_num"] == 24 and job["fps_den"] == 1
 
 
 def test_normalize_task_type_gate():
@@ -36,8 +37,24 @@ def test_normalize_blend_path_jail():
     assert err is None and job["blend_path"] == "scenes/ab12cd34_scene.blend"
 
 
+def test_normalize_explicit_scene_name():
+    job, err = fc.normalize_job({"scene_name": " RM_Compare ",
+                                 "view_layer_name": " Main ", "render": {}})
+    assert err is None and job["scene_name"] == "RM_Compare"
+    assert job["view_layer_name"] == "Main"
+    job, err = fc.normalize_job({"task_type": "bake", "scene_name": "Bake",
+                                 "bake": {"objects": ["Cube"]}})
+    assert err is None and job["scene_name"] == "Bake"
+    for bad in ("", "   ", 123):
+        _, err = fc.normalize_job({"scene_name": bad})
+        assert err
+        _, err = fc.normalize_job({"view_layer_name": bad})
+        assert err
+
+
 def test_normalize_frames_and_limits():
-    job, err = fc.normalize_job({"render": {"frame_start": 10, "frame_end": 20, "frame_step": 5}})
+    job, err = fc.normalize_job({"render": {"frame_start": 10, "frame_end": 20,
+                                             "frame_step": 5, "output": "frames"}})
     assert err is None and fc.frames_list(job) == [10, 15, 20]
     _, err = fc.normalize_job({"render": {"frame_start": 5, "frame_end": 1}})
     assert err
@@ -52,6 +69,15 @@ def test_normalize_video_rejects_exr():
     assert err
     job, err = fc.normalize_job({"render": {"output": "frames", "file_format": "OPEN_EXR"}})
     assert err is None and job["file_format"] == "OPEN_EXR"
+
+
+def test_normalize_video_rejects_sparse_timeline():
+    for render in ({"frame_start": 1, "frame_end": 10, "frame_step": 2},
+                   {"frames": "1,3,5"}):
+        _, err = fc.normalize_job({"render": render})
+        assert "连续帧" in err
+    job, err = fc.normalize_job({"render": {"frames": "1-3,4,5-7"}})
+    assert err is None and fc.frames_list(job) == list(range(1, 8))
 
 
 def test_normalize_overrides():
@@ -80,6 +106,16 @@ def test_ffmpeg_cmd():
     assert "-framerate 24" in s and "yuv420p" in s and "pad=" in s  # 奇数分辨率兜底
     assert "/v/_outputs/j1/frames/*.png" in s
     assert "-crf 20" in s and "-g 18" in s  # 质量参数(对齐 Flamenco;x264 默认 crf23 偏低)
+    ntsc = fc.ffmpeg_cmd("/frames", "/out.mp4", 24000, 1001)
+    assert ntsc[ntsc.index("-framerate") + 1] == "24000/1001"
+
+
+def test_normalize_fractional_fps():
+    job, err = fc.normalize_job({"render": {"fps_num": 24000, "fps_den": 1001}})
+    assert err is None and (job["fps_num"], job["fps_den"]) == (24000, 1001)
+    for values in ((0, 1), (24, 0), (241, 1), ("x", 1)):
+        _, err = fc.normalize_job({"render": {"fps_num": values[0], "fps_den": values[1]}})
+        assert err
 
 
 def test_expand_frame_spec():
@@ -91,11 +127,14 @@ def test_expand_frame_spec():
     for bad in ("", "a", "1-2:0", "5-1", "1-3,x"):
         with pytest.raises(ValueError):
             fc.expand_frame_spec(bad)
+    for huge in ("0-100000000", "0-99999"):
+        with pytest.raises(ValueError):
+            fc.expand_frame_spec(huge)
 
 
 def test_normalize_frames_spec():
     """render.frames(复合 spec 字符串)优先于 frame_start/end/step。"""
-    job, err = fc.normalize_job({"render": {"frames": "1, 5-8"}})
+    job, err = fc.normalize_job({"render": {"frames": "1, 5-8", "output": "frames"}})
     assert err is None and fc.frames_list(job) == [1, 5, 6, 7, 8]
     assert job["frames_spec"] == "1, 5-8"
     _, err = fc.normalize_job({"render": {"frames": "bad"}})
@@ -117,6 +156,9 @@ def test_bake_normalize_defaults():
     _, err = fc.normalize_job({"task_type": "bake", "bake": {}})
     assert err  # objects 必填
     _, err = fc.normalize_job({"task_type": "bake", "bake": {"objects": []}})
+    assert err
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["Cube"], "passes": []}})
     assert err
 
 
@@ -160,6 +202,17 @@ def test_safe_scene_name():
     assert fc.safe_scene_name("My Scene (v2).blend") == "My_Scene__v2_.blend"
     assert fc.safe_scene_name("../../../etc/passwd") == "passwd"
     assert fc.safe_scene_name("") == "scene.blend"
+    long_name = fc.safe_scene_name("x" * 300 + ".BLEND")
+    assert long_name.endswith(".blend") and len(long_name) <= 160
+
+
+def test_bake_output_stem_is_safe_and_collision_resistant():
+    a = fc.bake_output_stem("Body/A")
+    b = fc.bake_output_stem("Body\\A")
+    assert "/" not in a and "\\" not in a and a != b
+    assert fc.bake_output_stem("Body") != fc.bake_output_stem("body")
+    assert fc.bake_output_stem("鹅") == fc.bake_output_stem("鹅")
+    assert len((fc.bake_output_stem("鹅" * 200) + "_COMBINED.exr").encode()) < 256
 
 
 def test_bake_objects_dedupe():
@@ -186,4 +239,14 @@ def test_bake_visible_extra():
     assert err is None and job["visible_extra"] == ["B", "C"]
     _, err = fc.normalize_job({"task_type": "bake", "bake": {
         "objects": ["A"], "visible_extra": ["", "C"]}})
+    assert err
+
+
+def test_bake_isolation_modes():
+    for mode in ("TARGET", "SUBMITTED", "SCENE"):
+        job, err = fc.normalize_job({"task_type": "bake", "bake": {
+            "objects": ["A"], "isolation": mode.lower()}})
+        assert err is None and job["isolation"] == mode
+    _, err = fc.normalize_job({"task_type": "bake", "bake": {
+        "objects": ["A"], "isolation": "random"}})
     assert err

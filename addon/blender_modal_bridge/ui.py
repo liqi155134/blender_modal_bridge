@@ -33,6 +33,11 @@ def _scene_props():
         name="Visible Extra", default="",
         description="烘焙时额外保持可见的对象名(逗号分隔)。用于接触遮蔽参照:"
                     "相邻部件的高模等。默认只有目标对可见")
+    S.farm_bake_isolation = bpy.props.EnumProperty(
+        name="Isolation", default="TARGET",
+        items=[("TARGET", "Target Only", "仅当前目标对 + Visible Extra"),
+               ("SUBMITTED", "All Submitted", "所有本次提交对象 + Visible Extra"),
+               ("SCENE", "Whole Scene", "尊重整个 Scene 原始渲染可见性")])
     S.farm_bake_format = bpy.props.EnumProperty(
         name="Format", default="PNG",
         items=[("PNG", "PNG", ""), ("OPEN_EXR", "OpenEXR", "")])
@@ -59,7 +64,7 @@ def _del_scene_props():
               "farm_bake_roughness", "farm_bake_emit", "farm_bake_combined",
               "farm_bake_resolution", "farm_bake_margin", "farm_bake_s2a",
               "farm_bake_cage", "farm_bake_ray", "farm_bake_visible_extra",
-              "farm_bake_format",
+              "farm_bake_isolation", "farm_bake_format",
               "farm_frame_mode", "farm_frames_spec", "farm_output", "farm_file_format"):
         delattr(S, k)
 
@@ -91,10 +96,19 @@ class FARM_PT_panel(bpy.types.Panel):
         row.prop(sc, "farm_task", expand=True)
 
         col = lay.column(align=True)
+        col.label(text=f"Scene / Layer: {sc.name} / {context.view_layer.name}",
+                  icon="SCENE_DATA")
+        submit_ready = sc.render.engine == "CYCLES"
         if sc.farm_task == "BAKE":
-            n_sel = len([o for o in context.selected_objects if o.type == "MESH"])
+            selected = [o for o in context.selected_objects if o.type == "MESH"]
+            n_sel = len(selected)
             col.label(text=f"选中网格: {n_sel} 个" if n_sel else "先在视图选中要烘的网格",
                       icon="MESH_DATA" if n_sel else "ERROR")
+            submit_ready = submit_ready and bool(selected)
+            no_uv = [o.name for o in selected if not o.data.uv_layers]
+            if no_uv:
+                col.label(text=f"未展 UV: {', '.join(no_uv[:3])}", icon="ERROR")
+                submit_ready = False
             grid = col.grid_flow(columns=3, align=True)
             for p in ("farm_bake_normal", "farm_bake_ao", "farm_bake_diffuse",
                       "farm_bake_roughness", "farm_bake_emit", "farm_bake_combined"):
@@ -107,7 +121,16 @@ class FARM_PT_panel(bpy.types.Panel):
             if sc.farm_bake_s2a:
                 col.prop(sc, "farm_bake_cage")
                 col.prop(sc, "farm_bake_ray")
-            col.prop(sc, "farm_bake_visible_extra")
+            col.prop(sc, "farm_bake_isolation")
+            extra_row = col.row()
+            extra_row.enabled = sc.farm_bake_isolation != "SCENE"
+            extra_row.prop(sc, "farm_bake_visible_extra")
+            passes_on = any(getattr(sc, p) for p in (
+                "farm_bake_normal", "farm_bake_ao", "farm_bake_diffuse",
+                "farm_bake_roughness", "farm_bake_emit", "farm_bake_combined"))
+            if not passes_on:
+                col.label(text="至少勾选一个 Bake pass", icon="ERROR")
+            submit_ready = submit_ready and passes_on
         else:
             col.prop(sc, "farm_frame_mode")
             if sc.farm_frame_mode == "CUSTOM":
@@ -115,10 +138,28 @@ class FARM_PT_panel(bpy.types.Panel):
             row = col.row(align=True)
             row.prop(sc, "farm_output", expand=True)
             col.prop(sc, "farm_file_format")
+            if sc.camera is None:
+                col.label(text="当前 Scene 没有活动相机", icon="ERROR")
+                submit_ready = False
+            if sc.farm_output == "video" and sc.farm_file_format != "PNG":
+                col.label(text="Video 只支持 PNG;请换 PNG 或 Frames", icon="ERROR")
+                submit_ready = False
+            if sc.farm_output == "video" and sc.farm_frame_mode == "SCENE" \
+                    and sc.frame_step != 1:
+                col.label(text="Video 需要 Frame Step = 1;跳帧请选 Frames", icon="ERROR")
+                submit_ready = False
+            if sc.farm_output == "video" and sc.farm_frame_mode == "CUSTOM":
+                col.label(text="Custom 稀疏帧可能改变时长;提交时会校验连续性", icon="INFO")
         if sc.render.engine != "CYCLES":
             col.label(text=f"引擎是 {sc.render.engine},农场只支持 Cycles", icon="ERROR")
+        p = jobs.prefs()
+        if not bpy.data.filepath and (p.output_dir or "//render_farm/").startswith("//"):
+            col.label(text="先保存 .blend,才能使用 // 相对输出目录", icon="ERROR")
+            submit_ready = False
 
-        lay.operator("farm.submit", icon="RENDER_ANIMATION")  # ⚠ 别用 "CLOUD":5.2 无此图标,draw 会中断
+        submit_row = lay.row()
+        submit_row.enabled = submit_ready
+        submit_row.operator("farm.submit", icon="RENDER_ANIMATION")  # ⚠ Blender 5.2 无 CLOUD icon
         row = lay.row(align=True)
         row.operator("farm.test_connection", icon="PLUGIN")
         row.operator("farm.clear_finished", icon="TRASH")
@@ -137,12 +178,21 @@ class FARM_PT_panel(bpy.types.Panel):
         meta = "" if it.job_id.startswith("local-") else it.job_id[:8]
         if it.gpu:
             meta = f"{meta} · {it.gpu}" if meta else it.gpu
+        if it.render_device:
+            meta = f"{meta}/{it.render_device}"
         if meta:
             row.label(text=meta)
         if it.status in ("uploading", "queued", "running"):
             row.operator("farm.cancel", text="", icon="X").job_id = it.job_id
         elif it.status == "completed" and not it.downloaded:
             row.operator("farm.download", text="", icon="IMPORT").job_id = it.job_id
+        elif it.status == "completed" and it.downloaded:
+            row.operator("farm.open_output", text="", icon="FILE_FOLDER").job_id = it.job_id
+        elif (it.status == "failed" and it.request_id and it.blend_path
+              and it.task_json and it.output_root):
+            row.operator("farm.recover_submission", text="", icon="FILE_REFRESH").job_id = it.job_id
+        if it.error or it.trace or it.warnings:
+            row.operator("farm.job_details", text="", icon="INFO").job_id = it.job_id
 
         if it.status == "uploading":
             if it.xfer_total:
@@ -156,10 +206,13 @@ class FARM_PT_panel(bpy.types.Panel):
                              text=f"下载 {it.xfer_sent} / {it.xfer_total} MB", type="BAR")
             else:
                 box.label(text="下载产物中…", icon="IMPORT")
+        elif it.status == "recovering":
+            box.label(text="按 request ID 查找/恢复原任务…", icon="FILE_REFRESH")
         elif it.status == "running":
             if it.total:
+                unit = "单元" if it.task_type == "bake" else "帧"
                 box.progress(factor=min(1.0, it.step / max(1, it.total)),
-                             text=f"{it.step} / {it.total} 帧 · {it.s_it:.1f}s/帧"
+                             text=f"{it.step} / {it.total} {unit} · {it.s_it:.1f}s/{unit}"
                                   f" · 已 {it.elapsed}s", type="BAR")
             else:
                 box.label(text="云端启动中(容器冷启 + 场景加载)…", icon="SORTTIME")
@@ -169,7 +222,8 @@ class FARM_PT_panel(bpy.types.Panel):
             if it.downloaded:
                 box.label(text=f"✓ 完成,已下载 → {it.out_dir}"[:72], icon="CHECKMARK")
             else:
-                box.label(text="✓ 渲染完成(点 ⬇ 下载)", icon="CHECKMARK")
+                noun = "烘焙" if it.task_type == "bake" else "渲染"
+                box.label(text=f"✓ {noun}完成(点 ⬇ 下载)", icon="CHECKMARK")
         elif it.status == "failed":
             err = it.error or "failed"
             box.label(text=err[:68], icon="ERROR")
@@ -183,7 +237,8 @@ class FARM_PT_panel(bpy.types.Panel):
             box.label(text=it.error[:68], icon="ERROR")
         if it.warnings:
             n = it.warnings.count(";") + 1
-            box.label(text=f"⚠ {n} 条警告: {it.warnings[:56]}…",
+            box.label(text=f"⚠ {n} 条警告: {it.warnings[:56]}"
+                           f"{'… (点 ⓘ 查看全部)' if len(it.warnings) > 56 else ''}",
                       icon="LIBRARY_DATA_BROKEN")
 
 
